@@ -9,7 +9,9 @@ React showroom register with a Node/TypeScript backend for the Worldline Termina
 - Completion webhook receiver at `/api/worldline/webhook`
 - Browser and terminal receipt printing using Worldline SimpleText receipts converted to the JSON printer format with centered headings and left/right aligned columns
 - Async Device feature console with editable OpenAPI example payloads for all 17 Device examples: UI prompts/screens, data capture, selections, QR, image, signature, table, rating and print formats
-- Latest approved payment and lookup/reprint by a local six-digit showroom receipt number
+- Latest approved payment and receipt printing shown within Product register and Manual operations
+- Product-register operation status and abort control shown directly beneath the cart checkout
+- Tablet-first static-screen layout with a scrollable product list, larger product imagery, descriptions and prices; latest payment and receipt printing appear beneath checkout in Product register and beneath the form in Manual operations
 - Existing product catalog/editor, guarded by `ADMIN_PIN`
 
 **Not included yet:** other administrative controls, pre-authorisations, durable transaction storage, and JWT acquisition/refresh. Device examples are templates; terminal model, firmware, and configuration determine which features are supported. The JWT values are treated as supplied bearer tokens and are not refreshed by the app.
