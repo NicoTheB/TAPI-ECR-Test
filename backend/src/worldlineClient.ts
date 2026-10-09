@@ -69,6 +69,22 @@ export async function worldlineRequest<T = any>(terminal: CloudTerminal, endpoin
   return { status: response.status, data: data as T };
 }
 
+function saleSoftwareInfo() {
+  return {
+    IntegratorId: cloudConfig.integratorId,
+    SaleSoftware: [{
+      Type: 'ECR',
+      SubTypeInformation: 'Showroom',
+      Identification: {
+        ProviderIdentification: 'Worldline Showroom',
+        Identification: 'Showroom ECR',
+        SerialNumber: 'SHOWROOM-001',
+      },
+      Status: { VersionNumber: '1.0.0' },
+    }],
+  };
+}
+
 function makeHeader(terminal: CloudTerminal, operationId: string, webhookUrl: string, messageFunction: string) {
   return {
     MessageFunction: messageFunction,
@@ -76,19 +92,7 @@ function makeHeader(terminal: CloudTerminal, operationId: string, webhookUrl: st
     ExchangeIdentification: operationId,
     CreationDateTime: new Date().toISOString(),
     InitiatingParty: { Identification: terminal.initiatingParty, Type: 'Merchant' },
-    SalesSystemInfo: {
-      IntegratorId: cloudConfig.integratorId,
-      SaleSoftware: [{
-        Type: 'ECR',
-        SubTypeInformation: 'Showroom',
-        Identification: {
-          ProviderIdentification: 'Worldline Showroom',
-          Identification: 'Showroom ECR',
-          SerialNumber: 'SHOWROOM-001',
-        },
-        Status: { VersionNumber: '1.0.0' },
-      }],
-    },
+    SalesSystemInfo: saleSoftwareInfo(),
     WebhookUrl: webhookUrl,
     NumberOfRetries: cloudConfig.webhookRetries,
   };
@@ -241,10 +245,8 @@ export function makeAbortRequest(terminal: CloudTerminal, operationId: string, o
         ExchangeIdentification: randomUUID(),
         CreationDateTime: new Date().toISOString(),
         InitiatingParty: { Identification: terminal.initiatingParty, Type: 'Merchant' },
-        SalesSystemInfo: {
-          IntegratorId: cloudConfig.integratorId,
-          SaleSoftware: [{ Type: 'ECR', Status: { VersionNumber: '1.0.0' } }],
-        },
+        // Keep all ECR software identity fields identical to the original payment request.
+        SalesSystemInfo: saleSoftwareInfo(),
       },
       Abort: {
         Environment: environment(terminal),

@@ -336,7 +336,7 @@ app.post('/api/operations/:operationId/abort', async (req, res) => {
     operation.abortRequestId = acknowledgement.data?.requestId;
     operation.state = 'abort-requested';
     operation.message = 'Worldline accepted the abort signal. This is not yet confirmation that the terminal cancelled; waiting for the final transaction webhook.';
-    console.info(JSON.stringify({ event: 'worldline_abort_accepted', operationId: operation.operationId, terminalId: operation.terminalId, abortRequestId: operation.abortRequestId }));
+    console.info(JSON.stringify({ event: 'worldline_abort_accepted', operationId: operation.operationId, terminalId: operation.terminalId, targetExchangeId: operation.exchangeId, abortRequestId: operation.abortRequestId }));
     res.json(publicOperation(operation));
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Abort request failed.';
