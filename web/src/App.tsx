@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 
 type Kind = 'payment' | 'refund' | 'reversal' | 'reconciliation';
-type OperationKind = Kind | 'print';
+type OperationKind = Kind | 'print' | 'device';
 type OperationState = 'starting' | 'pending' | 'unknown' | 'abort-requested' | 'completed' | 'failed';
 type Op = {
   operationId: string;
@@ -19,8 +19,9 @@ type Product = { id: string; name: string; category: string; priceMinor: number;
 type ProductCatalog = { currency: string; minorUnitDivisor: number; products: Product[] };
 type ProductDraft = { id: string; name: string; category: string; price: string; description: string; image: string };
 type ReceiptToPrint = { receiptNumber?: string; plain?: string; printerCommands?: string; source: string };
+type DeviceFeature = { id: string; label: string; description: string; deviceRequest: Record<string, any> };
 
-const labels: Record<OperationKind, string> = { payment: 'Payment', refund: 'Refund', reversal: 'Reversal', reconciliation: 'Capture / Reconciliation', print: 'Terminal receipt print' };
+const labels: Record<OperationKind, string> = { payment: 'Payment', refund: 'Refund', reversal: 'Reversal', reconciliation: 'Capture / Reconciliation', print: 'Terminal receipt print', device: 'Device feature' };
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -67,7 +68,7 @@ export default function App() {
   const selectedTerminalRef = useRef('');
   const [catalog, setCatalog] = useState<ProductCatalog | null>(null);
   const [catalogError, setCatalogError] = useState('');
-  const [view, setView] = useState<'products' | 'manual' | 'settings' | 'product-settings'>('products');
+  const [view, setView] = useState<'products' | 'manual' | 'device' | 'settings' | 'product-settings'>('products');
   const [category, setCategory] = useState('All');
   const [cart, setCart] = useState<Record<string, number>>({});
   const [cartOperationId, setCartOperationId] = useState<string | null>(null);
@@ -77,6 +78,9 @@ export default function App() {
   const [receipt, setReceipt] = useState('');
   const [receiptSearch, setReceiptSearch] = useState('');
   const [receiptToPrint, setReceiptToPrint] = useState<ReceiptToPrint | null>(null);
+  const [deviceFeatures, setDeviceFeatures] = useState<DeviceFeature[]>([]);
+  const [deviceFeatureId, setDeviceFeatureId] = useState('');
+  const [deviceRequestJson, setDeviceRequestJson] = useState('');
   const [operation, setOperation] = useState<Op | null>(null);
   const [latest, setLatest] = useState<Record<string, any> | null>(null);
   const [latestError, setLatestError] = useState('');
@@ -100,6 +104,13 @@ export default function App() {
       setConfig(value);
       if (value.terminals.length) setSelectedTerminalId(current => current || value.terminals[0].id);
     }).catch(e => setNotice(e.message));
+    api<{ features: DeviceFeature[] }>('/api/device/features').then(value => {
+      setDeviceFeatures(value.features);
+      if (value.features.length) {
+        setDeviceFeatureId(value.features[0].id);
+        setDeviceRequestJson(JSON.stringify(value.features[0].deviceRequest, null, 2));
+      }
+    }).catch(e => setNotice(e instanceof Error ? e.message : 'Could not load device feature templates'));
     api<ProductCatalog>('/api/products').then(value => {
       if (!value.currency || !Number.isFinite(value.minorUnitDivisor) || value.minorUnitDivisor <= 0 || !Array.isArray(value.products)) {
         throw new Error('Product configuration is missing currency, minorUnitDivisor, or products.');
@@ -173,7 +184,7 @@ export default function App() {
     });
   }
 
-  async function startOperation(operationKind: Kind, body: Record<string, unknown>, fromCart = false) {
+  async function startOperation(operationKind: Kind | 'device', body: Record<string, unknown>, fromCart = false) {
     setNotice('');
     setReceiptToPrint(null);
     setBusy(true);
@@ -201,6 +212,20 @@ export default function App() {
         ? { terminalId: selectedTerminalId }
         : { terminalId: selectedTerminalId, amount: Number(amount), currencySymbol: currency.trim().toUpperCase(), minorUnitDivisor: 100 };
     await startOperation(kind, body);
+  }
+
+  async function submitDeviceFeature() {
+    if (!selectedTerminalId || !deviceFeatureId) return;
+    let deviceRequest: Record<string, any>;
+    try {
+      const parsed = JSON.parse(deviceRequestJson);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('The request must be a JSON object.');
+      deviceRequest = parsed;
+    } catch (error) {
+      setNotice(error instanceof Error ? `Invalid DeviceRequest JSON: ${error.message}` : 'Invalid DeviceRequest JSON.');
+      return;
+    }
+    await startOperation('device', { terminalId: selectedTerminalId, featureId: deviceFeatureId, deviceRequest });
   }
 
   async function abort() {
@@ -363,6 +388,7 @@ export default function App() {
     <div className="register-tabs" role="tablist" aria-label="Register mode">
       <button type="button" role="tab" aria-selected={view === 'products'} className={view === 'products' ? 'register-tab selected' : 'register-tab'} onClick={() => { setView('products'); setNotice(''); }}>Product register</button>
       <button type="button" role="tab" aria-selected={view === 'manual'} className={view === 'manual' ? 'register-tab selected' : 'register-tab'} onClick={() => { setView('manual'); setNotice(''); }}>Manual operations</button>
+      <button type="button" role="tab" aria-selected={view === 'device'} className={view === 'device' ? 'register-tab selected' : 'register-tab'} onClick={() => { setView('device'); setNotice(''); }}>Device features</button>
       <button type="button" role="tab" aria-selected={view === 'settings'} className={view === 'settings' ? 'register-tab selected' : 'register-tab'} onClick={() => { setView('settings'); setNotice(''); setSettingsMessage(''); }}>Terminal settings</button>
       <button type="button" role="tab" aria-selected={view === 'product-settings'} className={view === 'product-settings' ? 'register-tab selected' : 'register-tab'} onClick={() => { setView('product-settings'); setProductSettingsMessage(''); }}>Product settings</button>
     </div>
@@ -409,6 +435,28 @@ export default function App() {
             <button className="primary" type="submit" disabled={busy || operationIsActive || !config || !selectedTerminalId}>{busy ? 'Please wait…' : `Start ${labels[kind].toLowerCase()}`}<span>→</span></button>
           </form>
           <p className="security-note"><span>◆</span> Terminal credentials stay on the backend. Never retry while an operation outcome is unknown.</p>
+        </section>
+        {operationStatus}
+      </div>
+    </> : view === 'device' ? <>
+      <div className="layout device-layout">
+        <section className="card device-card">
+          <div className="card-title"><div><span className="eyebrow">WORLDLINE DEVICE API</span><h3>Device feature console</h3></div><span className="step">ASYNC</span></div>
+          <p className="field-note">Select a UI, input, or print example from the OpenAPI specification. The backend creates a fresh exchange ID, webhook URL, and trusted terminal environment for each request.</p>
+          <label htmlFor="device-feature-select">Device feature</label>
+          <select id="device-feature-select" value={deviceFeatureId} disabled={busy || operationIsActive || !deviceFeatures.length} onChange={event => {
+            const selected = deviceFeatures.find(feature => feature.id === event.target.value);
+            setDeviceFeatureId(event.target.value);
+            setDeviceRequestJson(selected ? JSON.stringify(selected.deviceRequest, null, 2) : '');
+            setNotice('');
+          }}>
+            {deviceFeatures.map(feature => <option key={feature.id} value={feature.id}>{feature.label}</option>)}
+          </select>
+          <p className="device-description">{deviceFeatures.find(feature => feature.id === deviceFeatureId)?.description}</p>
+          <label htmlFor="device-request-json">DeviceRequest fields <span className="hint">JSON editor</span></label>
+          <textarea id="device-request-json" className="device-json-editor" spellCheck={false} value={deviceRequestJson} onChange={event => setDeviceRequestJson(event.target.value)} disabled={busy || operationIsActive} />
+          <p className="field-note">Edit the selected example as needed. Send only the contents of Nexo `DeviceRequest`; do not add Header or wrapper fields. Unsupported features may be rejected by the terminal.</p>
+          <button className="primary" type="button" onClick={() => void submitDeviceFeature()} disabled={busy || operationIsActive || !config || !selectedTerminalId || !deviceFeatureId || selectedTerminal?.configured === false}>{busy ? 'Please wait…' : `Send ${deviceFeatures.find(feature => feature.id === deviceFeatureId)?.label ?? 'device request'}`}<span>→</span></button>
         </section>
         {operationStatus}
       </div>
@@ -464,7 +512,7 @@ export default function App() {
       {productSettingsMessage && <div className="notice" role="status">{productSettingsMessage}</div>}
     </section>}
 
-    {view !== 'settings' && view !== 'product-settings' && <>
+    {view !== 'settings' && view !== 'product-settings' && view !== 'device' && <>
       <section className="card latest-card"><div className="latest-copy"><span className="eyebrow">LOOKUP</span><h3>Latest payment</h3><p>Retrieve the latest approved payment received by this backend during the current session.</p></div><button className="secondary" type="button" onClick={getLatest} disabled={busy || operationIsActive || !selectedTerminalId}>{busy ? 'Working…' : 'Get latest payment'}<span>↗</span></button>{latestError && <div className="notice latest-notice">{latestError}</div>}{latest && <div className="latest-result"><div className="meta-row"><span>Outcome</span><strong className={latest.transactionOutcome === 'Approved' ? 'approved' : ''}>{latest.transactionOutcome ?? '—'}</strong></div><div className="meta-row"><span>Receipt</span><span>{latest.receiptNumber ?? '—'}</span></div><div className="meta-row"><span>Amount</span><span>{latest.amounts?.total ?? latest.amounts?.base ?? '—'} {latest.amounts?.currency?.symbol ?? ''}</span></div><details><summary>Full terminal response</summary><pre>{JSON.stringify(latest, null, 2)}</pre></details></div>}</section>
 
       <section className="card receipt-lookup-card"><div className="latest-copy"><span className="eyebrow">REPRINT</span><h3>Find transaction receipt</h3><p>Find a locally saved payment by its six-digit showroom receipt number.</p></div><form className="receipt-lookup-form" onSubmit={e => { e.preventDefault(); void loadReceipt(receiptSearch.trim()); }}><input aria-label="Receipt number to look up" inputMode="numeric" maxLength={6} pattern="[0-9]{6}" placeholder="Six-digit receipt number" value={receiptSearch} onChange={e => setReceiptSearch(e.target.value)} disabled={busy || operationIsActive || !selectedTerminalId} required /><button className="secondary" type="submit" disabled={busy || operationIsActive || !selectedTerminalId}>{busy ? 'Looking up…' : 'Find receipt'}<span>⌕</span></button></form>{receiptToPrint && <div className="receipt-actions"><div><strong>{receiptToPrint.source}</strong><span>{receiptToPrint.receiptNumber ? ` · Receipt ${receiptToPrint.receiptNumber}` : ''}</span></div><div className="receipt-buttons"><button className="secondary" type="button" onClick={() => { if (!receiptToPrint.plain) return; if (!printPlainReceipt(receiptToPrint.plain)) setNotice('Allow pop-ups for this site to print the receipt.'); }} disabled={!receiptToPrint.plain}>Print on this device</button><button className="secondary" type="button" onClick={printOnTerminal} disabled={busy || operationIsActive || !receiptToPrint.printerCommands}>Print on terminal</button></div>{!receiptToPrint.printerCommands && <p className="field-note">This response has no receipt text for terminal printing. Plain-text printing may still be available.</p>}</div>}{latestError && !latest && <div className="notice latest-notice">{latestError}</div>}</section>

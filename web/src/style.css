@@ -36,3 +36,8 @@
 /* Worldline cloud terminal identity settings */
 .terminal-settings-card{margin:16px 0;padding:16px;border:1px solid #ffffff16;border-radius:9px;background:#0c1920}.terminal-settings-card .card-title{margin-bottom:8px}.terminal-settings-fields{grid-template-columns:repeat(2,minmax(180px,1fr));max-width:760px}.terminal-settings-card>.field-note{margin:4px 0 0;color:#87999d;font-size:10px;line-height:1.5}
 @media(max-width:600px){.terminal-settings-fields{grid-template-columns:1fr}.terminal-settings-card{padding:12px}}
+
+
+/* Worldline async device feature console */
+.device-card{max-width:760px;width:100%}.device-description{margin:9px 0 14px;color:#9eb0b2;font-size:12px;line-height:1.55}.device-json-editor{display:block;width:100%;min-height:340px;resize:vertical;border:1px solid #344850;background:#0b171e;border-radius:7px;color:#d8e6dd;padding:12px;font:12px/1.55 'DM Mono',monospace;tab-size:2;outline:none}.device-json-editor:focus{border-color:#9aca5d;box-shadow:0 0 0 3px #9aca5d1c}.device-json-editor:disabled{opacity:.65}.device-card .field-note{line-height:1.55}.device-layout{align-items:start}
+@media(max-width:700px){.device-json-editor{min-height:260px;font-size:11px}}
