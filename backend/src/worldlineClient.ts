@@ -166,13 +166,67 @@ export function makeReconciliationRequest(terminal: CloudTerminal, operationId: 
   };
 }
 
+type JsonReceiptLine = {
+  CharacterStyle: 'Normal';
+  Alignment: 'Left' | 'Right' | 'Centred';
+  EndOfLineFlag: boolean;
+  Text: string;
+};
+
+// Convert Worldline's SimpleText receipt into the documented JSON printer extension.
+// Remove original padding, keep centered headings, and render double-spaced label/value
+// rows as a left-aligned label plus a right-aligned value on the same printer line.
+export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceiptLine[] {
+  const output: JsonReceiptLine[] = [];
+  const appendLine = (value: string, alignment: JsonReceiptLine['Alignment']) => {
+    if (!value) {
+      output.push({ CharacterStyle: 'Normal', Alignment: 'Left', EndOfLineFlag: true, Text: '' });
+      return;
+    }
+    for (let offset = 0; offset < value.length; offset += maxCharacters) {
+      const chunk = value.slice(offset, offset + maxCharacters);
+      output.push({ CharacterStyle: 'Normal', Alignment: alignment, EndOfLineFlag: true, Text: chunk });
+    }
+  };
+
+  for (const raw of text.replace(/\r\n?/g, '\n').split('\n')) {
+    const line = raw.replace(/\t/g, '    ');
+    const value = line.trim();
+    if (!value) {
+      appendLine('', 'Left');
+      continue;
+    }
+
+    const columns = value.match(/^(.+?)\s{2,}(.+)$/);
+    if (columns) {
+      const left = columns[1].trim();
+      const right = columns[2].trim();
+      // On the Worldline JSON format, EndOfLineFlag=false continues on the same line.
+      if (left.length <= maxCharacters && right.length <= maxCharacters) {
+        output.push({ CharacterStyle: 'Normal', Alignment: 'Left', EndOfLineFlag: false, Text: left });
+        output.push({ CharacterStyle: 'Normal', Alignment: 'Right', EndOfLineFlag: true, Text: right });
+      } else {
+        appendLine(left, 'Left');
+        appendLine(right, 'Right');
+      }
+      continue;
+    }
+
+    const leading = line.length - line.trimStart().length;
+    const trailing = line.length - line.trimEnd().length;
+    const centered = leading > 0 && trailing > 0 && Math.abs(leading - trailing) <= 2;
+    appendLine(value, centered ? 'Centred' : 'Left');
+  }
+  return output;
+}
+
 export function makePrintRequest(terminal: CloudTerminal, operationId: string, callbackToken: string, text: string) {
   return {
     SaleToPOIDeviceRequest: {
       Header: makeHeader(terminal, operationId, createWebhookUrl(operationId, callbackToken), 'DeviceRequest'),
       DeviceRequest: {
         Environment: environment(terminal),
-        PrintRequest: { OutputContent: { Format: 'SimpleText', MessageContent: text } },
+        PrintRequest: { OutputContent: { Format: 'JSON', OutputJSON: receiptTextToJson(text) } },
       },
     },
   };
