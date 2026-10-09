@@ -7,7 +7,7 @@ React showroom register with a Node/TypeScript backend for the Worldline Termina
 - Three backend-configured cloud terminal profiles (UMID, UTID, JWT are environment variables; the browser never receives JWTs)
 - Async card payment, unreferenced refund, referenced reversal of a payment recorded in this backend session, Acquirer Reconciliation/day-end (also exposed as capture), and abort
 - Completion webhook receiver at `/api/worldline/webhook`
-- Browser and terminal receipt printing using the receipt text supplied in a Worldline response
+- Browser and terminal receipt printing using Worldline SimpleText receipts converted to the JSON printer format with centered headings and left/right aligned columns
 - Latest approved payment and lookup/reprint by a local six-digit showroom receipt number
 - Existing product catalog/editor, guarded by `ADMIN_PIN`
 
@@ -78,9 +78,9 @@ Render's free instance can spin down when idle, and its local filesystem is ephe
 ## Important transaction notes
 
 - Reconciliation sends `SaleToPOIReconciliationRequest` to `/api/v2/merchants/{umid}/terminals/{utid}/reconciliation` with `ReconciliationType: AcquirerReconciliation`; the terminal may perform its day-end settlement. It is not a generic capture-all endpoint.
-- One active operation at a time is allowed per physical terminal. A cloud request timeout is treated as an unknown result; do not retry it until reconciled.
+- One active operation at a time is allowed per physical terminal. An HTTP 200 from `/payments/abort` confirms delivery of the abort signal, not the terminal cancellation itself; wait for the original payment webhook to confirm `ResponseReason: Aborted` (or another final outcome). A cloud request timeout is treated as an unknown result; do not retry it until reconciled.
 - The OpenAPI spec provides no historical payment-by-receipt endpoint. This backend saves successful payments in its own session and assigns a local six-digit receipt ID for lookup/reversal. It is not the terminal's printed receipt number.
 - Refund requests are sent as unreferenced Nexo refunds because the current frontend asks for an amount but no original-payment selection. Acquirer/terminal configuration may reject unreferenced refunds.
 - Reversal requires a payment previously approved and saved in the same backend session; the saved POI transaction identification is used as the original transaction reference.
-- Worldline payment receipt content is plain text. Terminal printing uses the API's `DeviceRequest.PrintRequest` with `Format: SimpleText`, not Samport ESC/P bytes.
+- Worldline payment receipt content arrives as SimpleText. Terminal printing converts those lines to Worldline's JSON printer extension (`Format: JSON`, `OutputJSON`) to preserve headings and label/value alignment; no ESC/P bytes are used. Text entries are trimmed and limited to 32 characters per printer entry based on the integration printer error observed during testing.
 - The free Render tier is not a suitable durable payment backend. This project is intended as a development/showroom integration and should not be exposed as an unauthenticated production point of sale.
