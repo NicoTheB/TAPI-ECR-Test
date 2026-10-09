@@ -8,10 +8,11 @@ React showroom register with a Node/TypeScript backend for the Worldline Termina
 - Async card payment, unreferenced refund, referenced reversal of a payment recorded in this backend session, Acquirer Reconciliation/day-end (also exposed as capture), and abort
 - Completion webhook receiver at `/api/worldline/webhook`
 - Browser and terminal receipt printing using Worldline SimpleText receipts converted to the JSON printer format with centered headings and left/right aligned columns
+- Async Device feature console with editable OpenAPI example payloads for all 17 Device examples: UI prompts/screens, data capture, selections, QR, image, signature, table, rating and print formats
 - Latest approved payment and lookup/reprint by a local six-digit showroom receipt number
 - Existing product catalog/editor, guarded by `ADMIN_PIN`
 
-**Not included yet:** other administrative/device controls beyond receipt printing and reconciliation, pre-authorisations, durable transaction storage, and JWT acquisition/refresh. The JWT values are treated as supplied bearer tokens and are not refreshed by the app.
+**Not included yet:** other administrative controls, pre-authorisations, durable transaction storage, and JWT acquisition/refresh. Device examples are templates; terminal model, firmware, and configuration determine which features are supported. The JWT values are treated as supplied bearer tokens and are not refreshed by the app.
 
 ## Authentication / identifiers
 
@@ -24,6 +25,14 @@ Copy `.env.example` to `.env`. Populate the per-terminal variables once Worldlin
 Use actual JWTs only in local `.env` or Render environment settings—never commit them or put them in frontend code. `WORLDLINE_INTEGRATOR_ID` is already set to `239240630F36B979`. The integration base URL is the default; change `WORLDLINE_BASE_URL` to the production URL only when authorized. Optional `*_POI_ID` values populate the Nexo `Environment.POI` field; leave blank unless Worldline specifies a value.
 
 A configured request contains Nexo protocol version `5.1-WL2.1.1`, the IntegratorId and ECR software identity, a unique exchange ID, and the callback URL. Amounts from the frontend are minor currency units and the backend converts them using the catalog divisor (or `WORLDLINE_MINOR_UNIT_DIVISOR` for manual requests).
+
+## Worldline Device feature console
+
+Open **Device features** in the frontend to try all 17 Device examples in the supplied OpenAPI document. The backend serves the template payloads at `GET /api/device/features`; the browser edits only the inner Nexo `DeviceRequest` JSON. On send, the backend validates the feature ID, supplies the selected terminal's trusted `Environment`, and creates fresh Nexo Header, exchange ID and webhook callback values before posting asynchronously to `/device`. The operation completes when the matching webhook arrives.
+
+The console includes all listed UI screen/input examples and print examples (SimpleText, QR/barcode, Image, JSON receipt and multi-format). Templates are starting points and can be edited in the JSON editor. The `UIImageRequest` and `PrintImageRequest` examples include OpenAPI sample base64 image data. Not every terminal supports every extension; a terminal/API rejection is shown in the operation result. Some requests wait for customer input on-device until their configured `MaximumInputTime` expires.
+
+The existing receipt-reprint action remains a separate `print` operation; it converts its plain-text receipt to JSON printer lines.
 
 ## Configure terminal names in the frontend
 
