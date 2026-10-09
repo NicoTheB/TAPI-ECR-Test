@@ -76,7 +76,6 @@ export default function App() {
   const [amount, setAmount] = useState('100');
   const [currency, setCurrency] = useState('DKK');
   const [receipt, setReceipt] = useState('');
-  const [receiptSearch, setReceiptSearch] = useState('');
   const [receiptToPrint, setReceiptToPrint] = useState<ReceiptToPrint | null>(null);
   const [deviceFeatures, setDeviceFeatures] = useState<DeviceFeature[]>([]);
   const [deviceFeatureId, setDeviceFeatureId] = useState('');
@@ -164,6 +163,7 @@ export default function App() {
     if (operation?.state === 'completed') {
       const content = getReceiptContent(operation.result, `${labels[operation.kind]} response`);
       if (content && selectedTerminalRef.current === operation.terminalId) setReceiptToPrint(content);
+      if (operation.kind === 'payment' && operation.result?.transactionOutcome === 'Approved') setLatest(operation.result);
     }
   }, [operation?.state, operation?.operationId, operation?.terminalId, operation?.kind, operation?.result]);
 
@@ -233,18 +233,6 @@ export default function App() {
     setBusy(true); setNotice('');
     try { setOperation(await api<Op>(`/api/operations/${encodeURIComponent(operation.operationId)}/abort`, { method: 'POST' })); }
     catch (e) { setNotice(e instanceof Error ? e.message : 'Abort request failed'); }
-    finally { setBusy(false); }
-  }
-
-  async function loadReceipt(receiptNumber: string) {
-    setBusy(true); setLatestError(''); setNotice('');
-    try {
-      const found = await api<Record<string, any>>(`/api/payments/${encodeURIComponent(receiptNumber)}?terminalId=${encodeURIComponent(selectedTerminalId)}`);
-      setLatest(found);
-      const content = getReceiptContent(found, `Payment ${receiptNumber}`);
-      setReceiptToPrint(content);
-      if (!content) setLatestError('Payment was found, but its response does not contain receipt data for printing.');
-    } catch (e) { setLatestError(e instanceof Error ? e.message : 'Could not retrieve payment'); }
     finally { setBusy(false); }
   }
 
@@ -375,6 +363,10 @@ export default function App() {
     {notice && <div className="notice" role="alert">{notice}</div>}
   </section>;
 
+  const latestPaymentPanel = (
+    <section className="card latest-card"><div className="latest-copy"><span className="eyebrow">PAYMENT RECEIPT</span><h3>Latest payment</h3><p>View and print the latest approved payment receipt.</p></div><button className="secondary" type="button" onClick={getLatest} disabled={busy || operationIsActive || !selectedTerminalId}>{busy ? 'Working…' : 'Get latest payment'}<span>↗</span></button>{latestError && <div className="notice latest-notice">{latestError}</div>}{latest && <div className="latest-result"><div className="meta-row"><span>Outcome</span><strong className={latest.transactionOutcome === 'Approved' ? 'approved' : ''}>{latest.transactionOutcome ?? '—'}</strong></div><div className="meta-row"><span>Receipt</span><span>{latest.receiptNumber ?? '—'}</span></div><div className="meta-row"><span>Amount</span><span>{latest.amounts?.total ?? latest.amounts?.base ?? '—'} {latest.amounts?.currency?.symbol ?? latest.amounts?.currencySymbol ?? ''}</span></div><details><summary>Full terminal response</summary><pre>{JSON.stringify(latest, null, 2)}</pre></details></div>}{receiptToPrint && <div className="receipt-actions"><div><strong>{receiptToPrint.source}</strong><span>{receiptToPrint.receiptNumber ? ` · Receipt ${receiptToPrint.receiptNumber}` : ''}</span></div><div className="receipt-buttons"><button className="secondary" type="button" onClick={() => { if (!receiptToPrint.plain) return; if (!printPlainReceipt(receiptToPrint.plain)) setNotice('Allow pop-ups for this site to print the receipt.'); }} disabled={!receiptToPrint.plain}>Print on this device</button><button className="secondary" type="button" onClick={printOnTerminal} disabled={busy || operationIsActive || !receiptToPrint.printerCommands}>{operation?.kind === 'print' && operationIsActive ? 'Printing…' : 'Print on terminal'}</button></div>{!receiptToPrint.printerCommands && <p className="field-note">This response has no receipt text for terminal printing. Plain-text printing may still be available.</p>}</div>}</section>
+  );
+
   return <main className="shell">
     <header className="topbar">
       <div className="brand"><div className="brand-mark">W</div><div><span className="eyebrow">WORLDLINE CLOUD TERMINALS</span><h1>Showroom ECR</h1></div></div>
@@ -418,10 +410,11 @@ export default function App() {
           </div>)}</div>}
           <div className="cart-total"><span>Total</span><strong>{formatPrice(cartTotalMinor)}</strong></div>
           <button className="primary checkout-button" type="button" disabled={busy || operationIsActive || !selectedTerminalId || !catalog || cartTotalMinor <= 0} onClick={checkout}>{busy ? 'Please wait…' : 'Pay at selected terminal'}<span>→</span></button>
+          {latestPaymentPanel}
           <p className="security-note"><span>◆</span> Product lines stay in this register; the terminal receives the total amount only.</p>
+          {operationStatus}
         </section>
       </div>
-      {operationStatus}
     </> : view === 'manual' ? <>
       <div className="layout">
         <section className="card transaction-card">
@@ -434,6 +427,7 @@ export default function App() {
             </> : kind === 'reversal' ? <><label htmlFor="receipt">Original local receipt number</label><input id="receipt" type="text" required maxLength={6} placeholder="e.g. 000013" value={receipt} onChange={e => setReceipt(e.target.value)} disabled={operationIsActive || busy} /><p className="field-note">Reversals can reference payments saved by this backend during the current session.</p></> : <div className="field-note"><strong>Acquirer reconciliation / day end</strong><br />Sends `ReconciliationType: AcquirerReconciliation` to the selected terminal and waits for the async webhook result. This may initiate terminal day-end settlement.</div>}
             <button className="primary" type="submit" disabled={busy || operationIsActive || !config || !selectedTerminalId}>{busy ? 'Please wait…' : `Start ${labels[kind].toLowerCase()}`}<span>→</span></button>
           </form>
+          {latestPaymentPanel}
           <p className="security-note"><span>◆</span> Terminal credentials stay on the backend. Never retry while an operation outcome is unknown.</p>
         </section>
         {operationStatus}
@@ -483,7 +477,7 @@ export default function App() {
         <button className="text-button lock-settings" type="button" onClick={() => { setSettingsUnlocked(false); setSettings([]); setAdminPin(''); }}>Lock terminal settings</button>
       </form>}
       {settingsMessage && <div className="notice" role="status">{settingsMessage}</div>}
-    </section> : <section className="card settings-card product-settings-card">
+    </section> : view === 'product-settings' ? <section className="card settings-card product-settings-card">
       <div className="card-title"><div><span className="eyebrow">BACKEND-MANAGED</span><h3>Product catalog</h3></div><span className="step">ADMIN</span></div>
       {!config?.settingsEnabled && <div className="notice" role="alert">Product editing is locked. Configure `ADMIN_PIN` in the backend `.env` and restart the app.</div>}
       {!productsUnlocked ? <form className="settings-unlock" onSubmit={unlockProducts}>
@@ -510,13 +504,9 @@ export default function App() {
         <button className="text-button lock-settings" type="button" onClick={lockProducts}>Lock product editor</button>
       </form>}
       {productSettingsMessage && <div className="notice" role="status">{productSettingsMessage}</div>}
-    </section>}
+    </section> : null}
 
-    {view !== 'settings' && view !== 'product-settings' && view !== 'device' && <>
-      <section className="card latest-card"><div className="latest-copy"><span className="eyebrow">LOOKUP</span><h3>Latest payment</h3><p>Retrieve the latest approved payment received by this backend during the current session.</p></div><button className="secondary" type="button" onClick={getLatest} disabled={busy || operationIsActive || !selectedTerminalId}>{busy ? 'Working…' : 'Get latest payment'}<span>↗</span></button>{latestError && <div className="notice latest-notice">{latestError}</div>}{latest && <div className="latest-result"><div className="meta-row"><span>Outcome</span><strong className={latest.transactionOutcome === 'Approved' ? 'approved' : ''}>{latest.transactionOutcome ?? '—'}</strong></div><div className="meta-row"><span>Receipt</span><span>{latest.receiptNumber ?? '—'}</span></div><div className="meta-row"><span>Amount</span><span>{latest.amounts?.total ?? latest.amounts?.base ?? '—'} {latest.amounts?.currency?.symbol ?? ''}</span></div><details><summary>Full terminal response</summary><pre>{JSON.stringify(latest, null, 2)}</pre></details></div>}</section>
 
-      <section className="card receipt-lookup-card"><div className="latest-copy"><span className="eyebrow">REPRINT</span><h3>Find transaction receipt</h3><p>Find a locally saved payment by its six-digit showroom receipt number.</p></div><form className="receipt-lookup-form" onSubmit={e => { e.preventDefault(); void loadReceipt(receiptSearch.trim()); }}><input aria-label="Receipt number to look up" inputMode="numeric" maxLength={6} pattern="[0-9]{6}" placeholder="Six-digit receipt number" value={receiptSearch} onChange={e => setReceiptSearch(e.target.value)} disabled={busy || operationIsActive || !selectedTerminalId} required /><button className="secondary" type="submit" disabled={busy || operationIsActive || !selectedTerminalId}>{busy ? 'Looking up…' : 'Find receipt'}<span>⌕</span></button></form>{receiptToPrint && <div className="receipt-actions"><div><strong>{receiptToPrint.source}</strong><span>{receiptToPrint.receiptNumber ? ` · Receipt ${receiptToPrint.receiptNumber}` : ''}</span></div><div className="receipt-buttons"><button className="secondary" type="button" onClick={() => { if (!receiptToPrint.plain) return; if (!printPlainReceipt(receiptToPrint.plain)) setNotice('Allow pop-ups for this site to print the receipt.'); }} disabled={!receiptToPrint.plain}>Print on this device</button><button className="secondary" type="button" onClick={printOnTerminal} disabled={busy || operationIsActive || !receiptToPrint.printerCommands}>Print on terminal</button></div>{!receiptToPrint.printerCommands && <p className="field-note">This response has no receipt text for terminal printing. Plain-text printing may still be available.</p>}</div>}{latestError && !latest && <div className="notice latest-notice">{latestError}</div>}</section>
-    </>}
 
     <footer><span>Worldline Terminal API · Async mode</span><span>Showroom integration · Webhook callback</span></footer>
   </main>;
