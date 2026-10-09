@@ -44,6 +44,7 @@ type Operation = {
   callbackToken: string;
   exchangeId: string;
   requestId?: string;
+  abortRequestId?: string;
 };
 type SavedTransaction = {
   terminalId: string;
@@ -331,12 +332,15 @@ app.post('/api/operations/:operationId/abort', async (req, res) => {
   const terminal = terminals.find(item => item.id === operation.terminalId)!;
   try {
     const payload = makeAbortRequest(terminal, operation.operationId, operation.exchangeId);
-    await worldlineRequest(terminal, 'payments/abort', payload);
+    const acknowledgement = await worldlineRequest<{ requestId?: string }>(terminal, 'payments/abort', payload);
+    operation.abortRequestId = acknowledgement.data?.requestId;
     operation.state = 'abort-requested';
-    operation.message = 'Abort delivered to Worldline. Waiting for the final terminal response webhook.';
+    operation.message = 'Worldline accepted the abort signal. This is not yet confirmation that the terminal cancelled; waiting for the final transaction webhook.';
+    console.info(JSON.stringify({ event: 'worldline_abort_accepted', operationId: operation.operationId, terminalId: operation.terminalId, abortRequestId: operation.abortRequestId }));
     res.json(publicOperation(operation));
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Abort request failed.';
+    console.error(JSON.stringify({ event: 'worldline_abort_failed', operationId: operation.operationId, terminalId: operation.terminalId, error: message }));
     res.status(error instanceof WorldlineHttpError ? error.status : 502).json({ error: message, operation: publicOperation(operation) });
   }
 });
@@ -353,6 +357,7 @@ app.post('/api/worldline/webhook', (req, res) => {
   }
   if (operation.state === 'completed') { res.status(200).json({ ok: true, duplicate: true }); return; }
   completeOperation(operation, req.body);
+  console.info(JSON.stringify({ event: 'worldline_webhook_completed', operationId, terminalId: operation.terminalId, kind: operation.kind, state: operation.state, outcome: operation.result?.transactionOutcome, detail: operation.result?.outcomeDescription }));
   res.status(200).json({ ok: true });
 });
 
@@ -390,7 +395,9 @@ function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string,
   const authResponse = retailerResult?.TransactionResponse?.AuthorisationResult?.ResponseToAuthorisation?.Response
     ?? paymentTransaction?.TransactionResponse?.AuthorisationResult?.ResponseToAuthorisation?.Response;
   const responseStatus = service?.Response?.Response ?? service?.Response?.Result ?? reconciliation?.Response?.Response ?? '';
-  const responseReason = service?.Response?.ResponseReason ?? reconciliation?.Response?.ResponseReason ?? raw?.SaleToPOIMessageRejection?.RejectReason ?? '';
+  const rejection = raw?.SaleToPOIMessageRejection?.Reject ?? {};
+  const responseReason = service?.Response?.ResponseReason ?? reconciliation?.Response?.ResponseReason ?? rejection?.RejectReason ?? '';
+  const rejectionDetail = rejection?.AdditionalInformation ?? rejection?.RejectReason ?? '';
   const successfulServiceResponse = ['success', 'successful'].includes(String(responseStatus).toLowerCase());
   const approved = String(authResponse ?? '').toLowerCase() === 'approved'
     || (successfulServiceResponse && !authResponse && kind !== 'print');
@@ -417,7 +424,7 @@ function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string,
     currency: currency ? { symbol: currency } : undefined,
     currencySymbol: currency,
   } : undefined;
-  let outcomeDescription = responseReason || service?.Response?.AdditionalResponseInformation || reconciliation?.Response?.AdditionalResponseInformation || '';
+  let outcomeDescription = rejectionDetail || responseReason || service?.Response?.AdditionalResponseInformation || reconciliation?.Response?.AdditionalResponseInformation || '';
   if (!outcomeDescription && authResponse && authResponse !== 'Approved') outcomeDescription = `Authorisation: ${authResponse}`;
   if (!outcomeDescription && responseStatus && !approved) outcomeDescription = `Worldline response: ${responseStatus}`;
   const identifier = originalId ?? payment?.SaleTransactionIdentification ?? paymentTransaction?.TransactionIdentification;
