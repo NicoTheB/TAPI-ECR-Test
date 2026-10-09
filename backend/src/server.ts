@@ -4,7 +4,8 @@ import path from 'node:path';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { z } from 'zod';
 import { cloudConfig, safeTerminals, terminals, terminalConfigured, CloudTerminal } from './cloudConfig';
-import { makeAbortRequest, makeFinancialRequest, makePrintRequest, makeReconciliationRequest, worldlineRequest, WorldlineHttpError, WorldlineOperationKind } from './worldlineClient';
+import { makeAbortRequest, makeDeviceFeatureRequest, makeFinancialRequest, makePrintRequest, makeReconciliationRequest, worldlineRequest, WorldlineHttpError, WorldlineOperationKind } from './worldlineClient';
+import { deviceFeatureTemplates } from './deviceFeatures';
 
 const app = express();
 app.use(express.json({ limit: '512kb' }));
@@ -19,6 +20,11 @@ const moneySchema = z.object({
 const reversalSchema = z.object({ terminalId: z.string().min(1), receiptNumber: z.string().trim().min(1).max(64) });
 const reconciliationSchema = z.object({ terminalId: z.string().min(1) });
 const printSchema = z.object({ terminalId: z.string().min(1), receiptData: z.string().trim().min(1).max(20000) });
+const deviceFeatureSchema = z.object({
+  terminalId: z.string().min(1),
+  featureId: z.string().min(1).max(80),
+  deviceRequest: z.record(z.unknown()).refine(value => Boolean(value.InputRequest || value.PrintRequest), 'DeviceRequest must include InputRequest or PrintRequest.'),
+});
 const productCatalogSchema = z.object({
   currency: z.string().trim().toUpperCase().regex(/^[A-Z]{3}$/),
   minorUnitDivisor: z.union([z.literal(1), z.literal(10), z.literal(100), z.literal(1000)]),
@@ -130,6 +136,7 @@ app.get('/api/config', (_req, res) => res.json({
   pollIntervalMs: 1200,
   webhookMode: (() => { try { return new URL(cloudConfig.webhookBaseUrl).hostname; } catch { return 'invalid'; } })(),
 }));
+app.get('/api/device/features', (_req, res) => res.json({ features: deviceFeatureTemplates }));
 app.get('/api/products', (_req, res) => {
   try { res.json(readProductCatalog()); }
   catch (error) { res.status(500).json({ error: error instanceof Error ? error.message : 'Could not load product catalog.' }); }
@@ -229,11 +236,12 @@ app.post('/api/operations/reversal', (req, res) => void startOperation('reversal
 app.post('/api/operations/reconciliation', (req, res) => void startOperation('reconciliation', req, res));
 app.post('/api/operations/capture', (req, res) => void startOperation('reconciliation', req, res));
 app.post('/api/operations/print', (req, res) => void startOperation('print', req, res));
+app.post('/api/operations/device', (req, res) => void startOperation('device', req, res));
 
 async function startOperation(kind: WorldlineOperationKind, req: Request, res: Response) {
-  let input: z.infer<typeof moneySchema> | z.infer<typeof reversalSchema> | z.infer<typeof reconciliationSchema> | z.infer<typeof printSchema>;
+  let input: z.infer<typeof moneySchema> | z.infer<typeof reversalSchema> | z.infer<typeof reconciliationSchema> | z.infer<typeof printSchema> | z.infer<typeof deviceFeatureSchema>;
   try {
-    input = kind === 'payment' || kind === 'refund' ? moneySchema.parse(req.body) : kind === 'reversal' ? reversalSchema.parse(req.body) : kind === 'reconciliation' ? reconciliationSchema.parse(req.body) : printSchema.parse(req.body);
+    input = kind === 'payment' || kind === 'refund' ? moneySchema.parse(req.body) : kind === 'reversal' ? reversalSchema.parse(req.body) : kind === 'reconciliation' ? reconciliationSchema.parse(req.body) : kind === 'device' ? deviceFeatureSchema.parse(req.body) : printSchema.parse(req.body);
   } catch (error) {
     const issues = error instanceof z.ZodError ? error.issues.map(issue => ({ field: issue.path.join('.'), message: issue.message })) : [];
     res.status(400).json({ error: 'Invalid operation request.', details: issues });
@@ -281,6 +289,12 @@ async function startOperation(kind: WorldlineOperationKind, req: Request, res: R
       payload = makeFinancialRequest(terminal, 'reversal', operationId, callbackToken, { originalTransaction: originalTransaction!.originalTransaction });
     } else if (kind === 'reconciliation') {
       payload = makeReconciliationRequest(terminal, operationId, callbackToken);
+    } else if (kind === 'device') {
+      const deviceInput = input as z.infer<typeof deviceFeatureSchema>;
+      if (!deviceFeatureTemplates.some(feature => feature.id === deviceInput.featureId)) {
+        throw new Error('Select a supported Worldline Device feature.');
+      }
+      payload = makeDeviceFeatureRequest(terminal, operationId, callbackToken, deviceInput.deviceRequest);
     } else {
       payload = makePrintRequest(terminal, operationId, callbackToken, (input as z.infer<typeof printSchema>).receiptData);
     }
@@ -292,7 +306,7 @@ async function startOperation(kind: WorldlineOperationKind, req: Request, res: R
   operations.set(operationId, operation);
   activeByTerminal.set(terminal.id, operationId);
   try {
-    const endpoint = kind === 'print' ? 'device' : kind === 'reconciliation' ? 'reconciliation' : 'payments';
+    const endpoint = kind === 'print' || kind === 'device' ? 'device' : kind === 'reconciliation' ? 'reconciliation' : 'payments';
     const reply = await worldlineRequest<any>(terminal, endpoint, payload);
     operation.requestId = reply.data?.requestId;
     if (reply.data?.data) {
@@ -394,9 +408,11 @@ function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string,
   const retailerResult = payment?.RetailerPaymentResult ?? {};
   const authResponse = retailerResult?.TransactionResponse?.AuthorisationResult?.ResponseToAuthorisation?.Response
     ?? paymentTransaction?.TransactionResponse?.AuthorisationResult?.ResponseToAuthorisation?.Response;
-  const responseStatus = service?.Response?.Response ?? service?.Response?.Result ?? reconciliation?.Response?.Response ?? '';
   const rejection = raw?.SaleToPOIMessageRejection?.Reject ?? {};
-  const responseReason = service?.Response?.ResponseReason ?? reconciliation?.Response?.ResponseReason ?? rejection?.RejectReason ?? '';
+  const deviceResponse = raw?.SaleToPOIDeviceResponse?.DeviceResponse ?? {};
+  const deviceStatus = deviceResponse?.Response?.Response ?? '';
+  const responseStatus = service?.Response?.Response ?? service?.Response?.Result ?? reconciliation?.Response?.Response ?? deviceStatus ?? '';
+  const responseReason = service?.Response?.ResponseReason ?? reconciliation?.Response?.ResponseReason ?? deviceResponse?.Response?.ResponseReason ?? rejection?.RejectReason ?? '';
   const rejectionDetail = rejection?.AdditionalInformation ?? rejection?.RejectReason ?? '';
   const successfulServiceResponse = ['success', 'successful'].includes(String(responseStatus).toLowerCase());
   const approved = String(authResponse ?? '').toLowerCase() === 'approved'
@@ -428,7 +444,6 @@ function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string,
   if (!outcomeDescription && authResponse && authResponse !== 'Approved') outcomeDescription = `Authorisation: ${authResponse}`;
   if (!outcomeDescription && responseStatus && !approved) outcomeDescription = `Worldline response: ${responseStatus}`;
   const identifier = originalId ?? payment?.SaleTransactionIdentification ?? paymentTransaction?.TransactionIdentification;
-  const deviceResponse = raw?.SaleToPOIDeviceResponse?.DeviceResponse?.Response?.Response;
   const result: Record<string, any> = {
     transactionOutcome,
     ...(outcomeDescription ? { outcomeDescription: String(outcomeDescription) } : {}),
@@ -439,10 +454,12 @@ function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string,
     ...(originalId?.TransactionDateTime && originalId?.TransactionReference ? { originalTransaction: { TransactionDateTime: originalId.TransactionDateTime, TransactionReference: originalId.TransactionReference } } : {}),
     ...(customerText || merchantText ? { receipt: { customer: { ...(customerText ? { plain: customerText, escpos: customerText } : {}) }, merchant: { ...(merchantText ? { plain: merchantText, escpos: merchantText } : {}) } } } : {}),
     ...(kind === 'reconciliation' && merchantText ? { receipt: { customer: { plain: merchantText, escpos: merchantText }, merchant: { plain: merchantText, escpos: merchantText } } } : {}),
-    ...(kind === 'print' ? { printResult: isRejection || (deviceResponse && !['success', 'successful'].includes(String(deviceResponse).toLowerCase())) ? 'Failed' : 'Success' } : {}),
+    ...(kind === 'print' ? { printResult: isRejection || (deviceStatus && !['success', 'successful'].includes(String(deviceStatus).toLowerCase())) ? 'Failed' : 'Success' } : {}),
+    ...(kind === 'device' ? { deviceResult: isRejection || (deviceStatus && !['success', 'successful'].includes(String(deviceStatus).toLowerCase())) ? 'Failed' : 'Success' } : {}),
     worldlineResponse: raw,
   };
   if (kind === 'print') result.transactionOutcome = result.printResult === 'Success' ? 'Approved' : 'Declined';
+  if (kind === 'device') result.transactionOutcome = result.deviceResult === 'Success' ? 'Completed' : 'Failed';
   return result;
 }
 

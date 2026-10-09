@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { CloudTerminal, cloudConfig, terminalConfigured } from './cloudConfig';
 
-export type WorldlineOperationKind = 'payment' | 'refund' | 'reversal' | 'reconciliation' | 'print';
+export type WorldlineOperationKind = 'payment' | 'refund' | 'reversal' | 'reconciliation' | 'print' | 'device';
 
 export class WorldlineHttpError extends Error {
   constructor(public status: number, message: string) {
@@ -222,6 +222,24 @@ export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceipt
     appendLine(value, centered ? 'Centred' : 'Left');
   }
   return output;
+}
+
+export function makeDeviceFeatureRequest(
+  terminal: CloudTerminal,
+  operationId: string,
+  callbackToken: string,
+  deviceRequest: Record<string, unknown>,
+) {
+  return {
+    SaleToPOIDeviceRequest: {
+      Header: makeHeader(terminal, operationId, createWebhookUrl(operationId, callbackToken), 'DeviceRequest'),
+      DeviceRequest: {
+        ...deviceRequest,
+        // Do not allow client-provided POI routing; always use trusted backend terminal config.
+        Environment: environment(terminal),
+      },
+    },
+  };
 }
 
 export function makePrintRequest(terminal: CloudTerminal, operationId: string, callbackToken: string, text: string) {
