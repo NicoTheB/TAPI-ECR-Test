@@ -1,0 +1,86 @@
+{
+  "currency": "DKK",
+  "minorUnitDivisor": 100,
+  "products": [
+    {
+      "id": "espresso",
+      "name": "Espresso",
+      "category": "Coffee & tea",
+      "priceMinor": 2800,
+      "description": "Single shot",
+      "image": "/products/images/espresso.svg"
+    },
+    {
+      "id": "filter-coffee",
+      "name": "Filter coffee",
+      "category": "Coffee & tea",
+      "priceMinor": 3200,
+      "description": "Freshly brewed",
+      "image": "/products/images/filter-coffee.svg"
+    },
+    {
+      "id": "latte",
+      "name": "Latte",
+      "category": "Coffee & tea",
+      "priceMinor": 4500,
+      "description": "Espresso with steamed milk",
+      "image": "/products/images/latte.svg"
+    },
+    {
+      "id": "tea",
+      "name": "Tea",
+      "category": "Coffee & tea",
+      "priceMinor": 2600,
+      "description": "Choose from today's selection",
+      "image": "/products/images/tea.svg"
+    },
+    {
+      "id": "water",
+      "name": "Sparkling water",
+      "category": "Drinks",
+      "priceMinor": 2200,
+      "description": "500 ml",
+      "image": "/products/images/water.svg"
+    },
+    {
+      "id": "orange-juice",
+      "name": "Orange juice",
+      "category": "Drinks",
+      "priceMinor": 3500,
+      "description": "Chilled juice",
+      "image": "/products/images/orange-juice.svg"
+    },
+    {
+      "id": "sandwich",
+      "name": "Sandwich",
+      "category": "Food",
+      "priceMinor": 7900,
+      "description": "Today's filling",
+      "image": "/products/images/sandwich.svg"
+    },
+    {
+      "id": "cinnamon-bun",
+      "name": "Cinnamon bun",
+      "category": "Food",
+      "priceMinor": 3600,
+      "description": "Baked in-house",
+      "image": "/products/images/cinnamon-bun.svg"
+    },
+    {
+      "id": "showroom-mug",
+      "name": "Showroom mug",
+      "category": "Merchandise",
+      "priceMinor": 12900,
+      "description": "Ceramic, 300 ml",
+      "image": "/products/images/showroom-mug.svg"
+    },
+    {
+      "id": "tote-bag",
+      "name": "Tote bag",
+      "category": "Merchandise",
+      "priceMinor": 8900,
+      "description": "Reusable cotton bag",
+      "image": "/products/images/tote-bag.svg"
+    }
+  ]
+}

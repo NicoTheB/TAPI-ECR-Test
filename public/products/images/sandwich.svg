@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 192" role="img" aria-label="Illustration of Sandwich">
+<defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#edcf9b"/><stop offset="1" stop-color="#c68b50"/></linearGradient><radialGradient id="glow"><stop stop-color="#fff" stop-opacity=".48"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient></defs>
+<rect width="256" height="192" rx="22" fill="url(#bg)"/><circle cx="205" cy="38" r="71" fill="url(#glow)"/><path d="M0 157c46-17 77 7 124-2s83-15 132 2v35H0z" fill="#fff" opacity=".19"/>
+<g filter="drop-shadow(0 8px 7px #432b2530)" stroke-linejoin="round" stroke-linecap="round"><ellipse cx="128" cy="159" rx="75" ry="13" fill="#c4a26e" opacity=".52"/><path d="M55 133l73-67 76 67-75 41z" fill="#f1cb7f"/><path d="M63 127l65-57 67 57-67 35z" fill="#fff0c7"/><path d="M66 130l61-53 62 53-62 33z" fill="#70a260"/><path d="M71 130l56-47 56 47-55 25z" fill="#cf6145"/><path d="M76 133l51-43 52 43-52 22z" fill="#f1d47c"/><path d="M62 139l66 31 67-31-1 12-66 35-67-32z" fill="#dca85f"/><path d="M88 126l16-14 16 14-16 9zm38-31 17 14-17 9-17-9zm17 44 17-12 13 10-18 12z" fill="#f7e8bf" opacity=".9"/></g>
+<circle cx="28" cy="28" r="4" fill="#fff" opacity=".65"/><circle cx="224" cy="142" r="3" fill="#fff" opacity=".6"/>
+</svg>
