@@ -14,7 +14,7 @@ type Op = {
 };
 type Terminal = { id: string; name: string; label: string; ip: string; port: number; address: string; configured?: boolean };
 type TerminalConfig = { terminals: Terminal[]; pollIntervalMs: number; settingsEnabled: boolean };
-type TerminalEdit = { id: string; name: string; label: string; initiatingParty: string; poiId: string; configured: boolean };
+type TerminalEdit = { id: string; name: string; label: string; initiatingParty: string; poiId: string; umid: string; utid: string; jwtConfigured: boolean; jwtInput: string; clearJwt: boolean; configured: boolean };
 type Product = { id: string; name: string; category: string; priceMinor: number; description?: string; image?: string };
 type ProductCatalog = { currency: string; minorUnitDivisor: number; products: Product[] };
 type ProductDraft = { id: string; name: string; category: string; price: string; description: string; image: string };
@@ -69,17 +69,24 @@ export default function App() {
   const [catalog, setCatalog] = useState<ProductCatalog | null>(null);
   const [catalogError, setCatalogError] = useState('');
   const [view, setView] = useState<'products' | 'manual' | 'device' | 'settings' | 'product-settings'>('products');
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    try { return localStorage.getItem('worldline-showroom-theme') === 'light' ? 'light' : 'dark'; }
+    catch { return 'dark'; }
+  });
   const [category, setCategory] = useState('All');
   const [cart, setCart] = useState<Record<string, number>>({});
   const [cartOperationId, setCartOperationId] = useState<string | null>(null);
   const [kind, setKind] = useState<Kind>('payment');
-  const [amount, setAmount] = useState('100');
+  const [amount, setAmount] = useState('1.00');
   const [currency, setCurrency] = useState('DKK');
   const [receipt, setReceipt] = useState('');
+  const [sendCaptureEmail, setSendCaptureEmail] = useState(false);
+  const [captureEmail, setCaptureEmail] = useState('');
   const [receiptToPrint, setReceiptToPrint] = useState<ReceiptToPrint | null>(null);
   const [deviceFeatures, setDeviceFeatures] = useState<DeviceFeature[]>([]);
   const [deviceFeatureId, setDeviceFeatureId] = useState('');
   const [deviceRequestJson, setDeviceRequestJson] = useState('');
+  const [deviceEditorExpanded, setDeviceEditorExpanded] = useState(false);
   const [operation, setOperation] = useState<Op | null>(null);
   const [latest, setLatest] = useState<Record<string, any> | null>(null);
   const [latestError, setLatestError] = useState('');
@@ -97,6 +104,25 @@ export default function App() {
   const [productSettingsMessage, setProductSettingsMessage] = useState('');
   const [productSettingsBusy, setProductSettingsBusy] = useState(false);
   const polling = useRef(false);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try { localStorage.setItem('worldline-showroom-theme', theme); } catch { /* Storage may be disabled; theme still applies for this session. */ }
+  }, [theme]);
+
+  useEffect(() => {
+    if (!deviceEditorExpanded) return;
+    const previousOverflow = document.body.style.overflow;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setDeviceEditorExpanded(false);
+    };
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [deviceEditorExpanded]);
 
   useEffect(() => {
     api<TerminalConfig>('/api/config').then(value => {
@@ -163,7 +189,11 @@ export default function App() {
     if (operation?.state === 'completed') {
       const content = getReceiptContent(operation.result, `${labels[operation.kind]} response`);
       if (content && selectedTerminalRef.current === operation.terminalId) setReceiptToPrint(content);
-      if (operation.kind === 'payment' && operation.result?.transactionOutcome === 'Approved') setLatest(operation.result);
+      if (operation.kind === 'payment') {
+        setLatest(operation.result ?? null);
+        setLatestError('');
+        setReceiptToPrint(getReceiptContent(operation.result, 'Latest payment attempt'));
+      }
     }
   }, [operation?.state, operation?.operationId, operation?.terminalId, operation?.kind, operation?.result]);
 
@@ -209,8 +239,8 @@ export default function App() {
     const body = kind === 'reversal'
       ? { terminalId: selectedTerminalId, receiptNumber: receipt.trim() }
       : kind === 'reconciliation'
-        ? { terminalId: selectedTerminalId }
-        : { terminalId: selectedTerminalId, amount: Number(amount), currencySymbol: currency.trim().toUpperCase(), minorUnitDivisor: 100 };
+        ? { terminalId: selectedTerminalId, sendCaptureEmail, ...(sendCaptureEmail ? { captureEmail: captureEmail.trim() } : {}) }
+        : { terminalId: selectedTerminalId, amount: Math.round(Number(amount) * 100), currencySymbol: currency.trim().toUpperCase(), minorUnitDivisor: 100 };
     await startOperation(kind, body);
   }
 
@@ -265,7 +295,7 @@ export default function App() {
     setSettingsBusy(true); setSettingsMessage('');
     try {
       const data = await api<{ terminals: TerminalEdit[] }>('/api/admin/terminals', { headers: { 'X-Admin-Pin': adminPin } });
-      setSettings(data.terminals);
+      setSettings(data.terminals.map(terminal => ({ ...terminal, jwtInput: '', clearJwt: false })));
       setSettingsUnlocked(true);
       setSettingsMessage('Terminal settings unlocked.');
     } catch (e) { setSettingsMessage(e instanceof Error ? e.message : 'Could not unlock terminal settings'); }
@@ -279,17 +309,39 @@ export default function App() {
       const saved = await api<{ terminals: TerminalEdit[] }>('/api/admin/terminals', {
         method: 'PUT',
         headers: { 'X-Admin-Pin': adminPin },
-        body: JSON.stringify({ terminals: settings.map(({ configured: _configured, ...terminal }) => terminal) }),
+        body: JSON.stringify({ terminals: settings.map(({ configured: _configured, jwtConfigured: _jwtConfigured, jwtInput, ...terminal }) => ({
+          ...terminal,
+          jwt: terminal.clearJwt ? undefined : (jwtInput.trim() || undefined),
+        })) }),
       });
-      setSettings(saved.terminals);
+      setSettings(saved.terminals.map(terminal => ({ ...terminal, jwtInput: '', clearJwt: false })));
       const updatedConfig = await api<TerminalConfig>('/api/config');
       setConfig(updatedConfig);
-      setSettingsMessage('Terminal names and request settings saved.');
+      setSettingsMessage('Terminal connection settings saved securely on the backend.');
     } catch (e) { setSettingsMessage(e instanceof Error ? e.message : 'Could not save terminal settings'); }
     finally { setSettingsBusy(false); }
   }
 
-  function updateSetting(index: number, field: 'name' | 'label' | 'initiatingParty' | 'poiId', value: string) {
+  async function exportLogs() {
+    setSettingsBusy(true);
+    setSettingsMessage('');
+    try {
+      const data = await api<{ exportedAt: string; records: unknown[] }>('/api/admin/logs', { headers: { 'X-Admin-Pin': adminPin } });
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `worldline-showroom-logs-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setSettingsMessage(`Downloaded ${data.records.length} structured log entries.`);
+    } catch (e) { setSettingsMessage(e instanceof Error ? e.message : 'Could not export logs'); }
+    finally { setSettingsBusy(false); }
+  }
+
+  function updateSetting(index: number, field: 'name' | 'label' | 'initiatingParty' | 'poiId' | 'umid' | 'utid' | 'jwtInput', value: string) {
     setSettings(current => current.map((terminal, i) => i === index ? { ...terminal, [field]: value } : terminal));
   }
 
@@ -364,13 +416,18 @@ export default function App() {
   </section>;
 
   const latestPaymentPanel = (
-    <section className="card latest-card"><div className="latest-copy"><span className="eyebrow">PAYMENT RECEIPT</span><h3>Latest payment</h3><p>View and print the latest approved payment receipt.</p></div><button className="secondary" type="button" onClick={getLatest} disabled={busy || operationIsActive || !selectedTerminalId}>{busy ? 'Working…' : 'Get latest payment'}<span>↗</span></button>{latestError && <div className="notice latest-notice">{latestError}</div>}{latest && <div className="latest-result"><div className="meta-row"><span>Outcome</span><strong className={latest.transactionOutcome === 'Approved' ? 'approved' : ''}>{latest.transactionOutcome ?? '—'}</strong></div><div className="meta-row"><span>Receipt</span><span>{latest.receiptNumber ?? '—'}</span></div><div className="meta-row"><span>Amount</span><span>{latest.amounts?.total ?? latest.amounts?.base ?? '—'} {latest.amounts?.currency?.symbol ?? latest.amounts?.currencySymbol ?? ''}</span></div><details><summary>Full terminal response</summary><pre>{JSON.stringify(latest, null, 2)}</pre></details></div>}{receiptToPrint && <div className="receipt-actions"><div><strong>{receiptToPrint.source}</strong><span>{receiptToPrint.receiptNumber ? ` · Receipt ${receiptToPrint.receiptNumber}` : ''}</span></div><div className="receipt-buttons"><button className="secondary" type="button" onClick={() => { if (!receiptToPrint.plain) return; if (!printPlainReceipt(receiptToPrint.plain)) setNotice('Allow pop-ups for this site to print the receipt.'); }} disabled={!receiptToPrint.plain}>Print on this device</button><button className="secondary" type="button" onClick={printOnTerminal} disabled={busy || operationIsActive || !receiptToPrint.printerCommands}>{operation?.kind === 'print' && operationIsActive ? 'Printing…' : 'Print on terminal'}</button></div>{!receiptToPrint.printerCommands && <p className="field-note">This response has no receipt text for terminal printing. Plain-text printing may still be available.</p>}</div>}</section>
+    <section className="card latest-card"><div className="latest-copy"><span className="eyebrow">PAYMENT RECEIPT</span><h3>Latest payment</h3><p>View the latest completed payment attempt, including declined or cancelled attempts. Receipt printing is available when the response includes receipt data.</p></div><button className="secondary" type="button" onClick={getLatest} disabled={busy || operationIsActive || !selectedTerminalId}>{busy ? 'Working…' : 'Get latest payment'}<span>↗</span></button>{latestError && <div className="notice latest-notice">{latestError}</div>}{latest && <div className="latest-result"><div className="meta-row"><span>Outcome</span><strong className={latest.transactionOutcome === 'Approved' ? 'approved' : ''}>{latest.transactionOutcome ?? '—'}</strong></div><div className="meta-row"><span>Showroom receipt</span><span>{latest.receiptNumber ?? (latest.transactionOutcome === 'Approved' ? '—' : 'Not assigned')}</span></div><div className="meta-row"><span>Amount</span><span>{latest.amounts?.total ?? latest.amounts?.base ?? '—'} {latest.amounts?.currency?.symbol ?? latest.amounts?.currencySymbol ?? ''}</span></div><details><summary>Full terminal response</summary><pre>{JSON.stringify(latest, null, 2)}</pre></details></div>}{receiptToPrint && <div className="receipt-actions"><div><strong>{receiptToPrint.source}</strong><span>{receiptToPrint.receiptNumber ? ` · Receipt ${receiptToPrint.receiptNumber}` : ''}</span></div><div className="receipt-buttons"><button className="secondary" type="button" onClick={() => { if (!receiptToPrint.plain) return; if (!printPlainReceipt(receiptToPrint.plain)) setNotice('Allow pop-ups for this site to print the receipt.'); }} disabled={!receiptToPrint.plain}>Print on this device</button><button className="secondary" type="button" onClick={printOnTerminal} disabled={busy || operationIsActive || !receiptToPrint.printerCommands}>{operation?.kind === 'print' && operationIsActive ? 'Printing…' : 'Print on terminal'}</button></div>{!receiptToPrint.printerCommands && <p className="field-note">This response has no receipt text for terminal printing. Plain-text printing may still be available.</p>}</div>}</section>
   );
 
   return <main className="shell">
     <header className="topbar">
       <div className="brand"><div className="brand-mark">W</div><div><span className="eyebrow">WORLDLINE CLOUD TERMINALS</span><h1>Showroom ECR</h1></div></div>
-      <div className="terminal-pill"><span className={`dot ${config ? 'online' : ''}`} />{selectedTerminal?.label ?? 'Connecting to backend…'}{selectedTerminal ? ` · ${selectedTerminal.address}` : ''}</div>
+      <div className="topbar-actions">
+        <div className="terminal-pill"><span className={`dot ${config ? 'online' : ''}`} />{selectedTerminal?.label ?? 'Connecting to backend…'}{selectedTerminal ? ` · ${selectedTerminal.address}` : ''}</div>
+        <button className="theme-toggle" type="button" aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`} aria-pressed={theme === 'light'} onClick={() => setTheme(current => current === 'dark' ? 'light' : 'dark')}>
+          <span aria-hidden="true">{theme === 'dark' ? '☀' : '☾'}</span> {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+        </button>
+      </div>
     </header>
 
     <section className="intro"><div><span className="eyebrow">ECR · ASYNCHRONOUS MODE</span><h2>Showroom ECR</h2><p>Build a product cart or start a manual terminal operation.</p></div><div className="intro-badge">TEST / SHOWROOM</div></section>
@@ -422,9 +479,9 @@ export default function App() {
           <div className="tabs" role="tablist">{(['payment', 'refund', 'reversal', 'reconciliation'] as Kind[]).map(value => <button type="button" key={value} role="tab" aria-selected={kind === value} className={kind === value ? 'tab selected' : 'tab'} disabled={operationIsActive || busy} onClick={() => { setKind(value); setNotice(''); }}>{labels[value]}</button>)}</div>
           <form onSubmit={submitManual}>
             {kind === 'payment' || kind === 'refund' ? <>
-              <label>Amount <span className="hint">minor units (e.g. 1000 = 10.00)</span></label>
-              <div className="amount-row"><input className="amount-input" type="number" min="1" step="1" required value={amount} onChange={e => setAmount(e.target.value)} disabled={operationIsActive || busy} /><select aria-label="Currency" value={currency} onChange={e => setCurrency(e.target.value)} disabled={operationIsActive || busy}><option>SEK</option><option>EUR</option><option>USD</option><option>NOK</option><option>DKK</option><option>GBP</option></select></div>
-            </> : kind === 'reversal' ? <><label htmlFor="receipt">Original local receipt number</label><input id="receipt" type="text" required maxLength={6} placeholder="e.g. 000013" value={receipt} onChange={e => setReceipt(e.target.value)} disabled={operationIsActive || busy} /><p className="field-note">Reversals can reference payments saved by this backend during the current session.</p></> : <div className="field-note"><strong>Acquirer reconciliation / day end</strong><br />Sends `ReconciliationType: AcquirerReconciliation` to the selected terminal and waits for the async webhook result. This may initiate terminal day-end settlement.</div>}
+              <label>Amount <span className="hint">major units (e.g. 10.00)</span></label>
+              <div className="amount-row"><input className="amount-input" type="number" min="0.01" step="0.01" required value={amount} onChange={e => setAmount(e.target.value)} disabled={operationIsActive || busy} /><select aria-label="Currency" value={currency} onChange={e => setCurrency(e.target.value)} disabled={operationIsActive || busy}><option>SEK</option><option>EUR</option><option>USD</option><option>NOK</option><option>DKK</option><option>GBP</option></select></div>
+            </> : kind === 'reversal' ? <><label htmlFor="receipt">Original local receipt number</label><input id="receipt" type="text" required maxLength={6} placeholder="e.g. 000013" value={receipt} onChange={e => setReceipt(e.target.value)} disabled={operationIsActive || busy} /><p className="field-note">Reversals can reference payments saved by this backend during the current session.</p></> : <div className="capture-email-options"><p className="field-note"><strong>Acquirer reconciliation / day end</strong><br />Sends `ReconciliationType: AcquirerReconciliation`. This may initiate terminal day-end settlement.</p><label className="capture-email-optin"><input type="checkbox" checked={sendCaptureEmail} onChange={e => setSendCaptureEmail(e.target.checked)} disabled={operationIsActive || busy} /> Email me the formatted JSON result</label>{sendCaptureEmail && <><label htmlFor="capture-email">Email recipient</label><input id="capture-email" type="email" maxLength={254} required value={captureEmail} onChange={e => setCaptureEmail(e.target.value)} disabled={operationIsActive || busy} placeholder="name@example.com" /><p className="field-note">Requires the backend Resend API key and a verified sender configured in environment settings.</p></>}</div>}
             <button className="primary" type="submit" disabled={busy || operationIsActive || !config || !selectedTerminalId}>{busy ? 'Please wait…' : `Start ${labels[kind].toLowerCase()}`}<span>→</span></button>
           </form>
           {latestPaymentPanel}
@@ -447,9 +504,11 @@ export default function App() {
             {deviceFeatures.map(feature => <option key={feature.id} value={feature.id}>{feature.label}</option>)}
           </select>
           <p className="device-description">{deviceFeatures.find(feature => feature.id === deviceFeatureId)?.description}</p>
-          <label htmlFor="device-request-json">DeviceRequest fields <span className="hint">JSON editor</span></label>
-          <textarea id="device-request-json" className="device-json-editor" spellCheck={false} value={deviceRequestJson} onChange={event => setDeviceRequestJson(event.target.value)} disabled={busy || operationIsActive} />
-          <p className="field-note">Edit the selected example as needed. Send only the contents of Nexo `DeviceRequest`; do not add Header or wrapper fields. Unsupported features may be rejected by the terminal.</p>
+          <div className="device-editor-collapsed">
+            <div><strong>DeviceRequest JSON editor</strong><span>{deviceRequestJson.split('\n').length} lines · {deviceRequestJson.length.toLocaleString()} characters</span></div>
+            <button className="secondary device-expand-button" type="button" aria-expanded={deviceEditorExpanded} aria-controls="device-editor-dialog" onClick={() => setDeviceEditorExpanded(true)} disabled={busy || operationIsActive}>Expand editor <span>⤢</span></button>
+          </div>
+          <p className="field-note">The request editor is collapsed to keep this screen compact. Expand it to review or edit the selected example. Send only the contents of Nexo `DeviceRequest`; the backend adds the header and terminal environment.</p>
           <button className="primary" type="button" onClick={() => void submitDeviceFeature()} disabled={busy || operationIsActive || !config || !selectedTerminalId || !deviceFeatureId || selectedTerminal?.configured === false}>{busy ? 'Please wait…' : `Send ${deviceFeatures.find(feature => feature.id === deviceFeatureId)?.label ?? 'device request'}`}<span>→</span></button>
         </section>
         {operationStatus}
@@ -468,12 +527,18 @@ export default function App() {
           <div className="catalog-settings-meta terminal-settings-fields">
             <label>Display name<input value={terminal.name} maxLength={80} onChange={e => updateSetting(index, 'name', e.target.value)} disabled={settingsBusy} required /></label>
             <label>Selector label<input value={terminal.label} maxLength={80} onChange={e => updateSetting(index, 'label', e.target.value)} disabled={settingsBusy} required /></label>
+            <label>UMID<input value={terminal.umid} maxLength={128} onChange={e => updateSetting(index, 'umid', e.target.value)} disabled={settingsBusy} autoComplete="off" /></label>
+            <label>UTID<input value={terminal.utid} maxLength={128} onChange={e => updateSetting(index, 'utid', e.target.value)} disabled={settingsBusy} autoComplete="off" /></label>
+            <label>API Key (JWT) <span className="hint">write-only</span><input type="password" value={terminal.jwtInput} maxLength={16384} onChange={e => updateSetting(index, 'jwtInput', e.target.value)} disabled={settingsBusy || terminal.clearJwt} autoComplete="new-password" placeholder={terminal.jwtConfigured ? 'Configured — blank keeps current key' : 'Paste bearer JWT'} /></label>
             <label>Nexo InitiatingParty ID<input value={terminal.initiatingParty} maxLength={35} onChange={e => updateSetting(index, 'initiatingParty', e.target.value)} disabled={settingsBusy} required /></label>
             <label>POI identification <span className="hint">optional</span><input value={terminal.poiId} maxLength={80} onChange={e => updateSetting(index, 'poiId', e.target.value)} disabled={settingsBusy} placeholder="Leave blank unless Worldline supplies one" /></label>
           </div>
-          <p className="field-note">{terminal.configured ? 'UMID, UTID, and JWT are present in backend environment.' : 'Add this terminal’s UMID, UTID, and JWT in backend environment variables before use.'}</p>
+          <div className="credential-actions">
+            <span className="field-note">{terminal.jwtConfigured ? 'JWT configured. Existing key is hidden.' : 'No JWT configured yet.'} UMID / UTID {terminal.umid && terminal.utid ? 'configured.' : 'required for API requests.'}</span>
+            {terminal.jwtConfigured && <label className="clear-jwt-control"><input type="checkbox" checked={terminal.clearJwt} onChange={event => setSettings(current => current.map((item, i) => i === index ? { ...item, clearJwt: event.target.checked, jwtInput: '' } : item))} disabled={settingsBusy} /> Clear saved JWT</label>}
+          </div>
         </div>)}
-        <div className="settings-actions"><button className="primary settings-save" type="submit" disabled={settingsBusy}>{settingsBusy ? 'Saving…' : 'Save terminal settings'}<span>→</span></button></div>
+        <div className="settings-actions"><button className="secondary" type="button" onClick={exportLogs} disabled={settingsBusy}>{settingsBusy ? 'Working…' : 'Download JSON logs'}</button><button className="primary settings-save" type="submit" disabled={settingsBusy}>{settingsBusy ? 'Saving…' : 'Save terminal settings'}<span>→</span></button></div>
         <button className="text-button lock-settings" type="button" onClick={() => { setSettingsUnlocked(false); setSettings([]); setAdminPin(''); }}>Lock terminal settings</button>
       </form>}
       {settingsMessage && <div className="notice" role="status">{settingsMessage}</div>}
@@ -507,6 +572,18 @@ export default function App() {
     </section> : null}
 
 
+
+    {deviceEditorExpanded && <div className="device-editor-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setDeviceEditorExpanded(false); }}>
+      <section id="device-editor-dialog" className="device-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="device-editor-title">
+        <div className="device-editor-dialog-header">
+          <div><span className="eyebrow">WORLDLINE DEVICE API</span><h2 id="device-editor-title">DeviceRequest JSON editor</h2></div>
+          <button className="secondary device-editor-close" type="button" onClick={() => setDeviceEditorExpanded(false)} aria-label="Close expanded JSON editor">Close <span>×</span></button>
+        </div>
+        <p className="field-note">Edit the request payload here. Changes are synchronized with the Device Features screen. Press Escape or select Close to return.</p>
+        <textarea className="device-json-editor device-json-editor-expanded" aria-label="Expanded DeviceRequest JSON editor" spellCheck={false} autoFocus value={deviceRequestJson} onChange={event => setDeviceRequestJson(event.target.value)} disabled={busy || operationIsActive} />
+        <div className="device-editor-dialog-footer"><span>{deviceRequestJson.length.toLocaleString()} characters</span><button className="primary" type="button" onClick={() => setDeviceEditorExpanded(false)}>Done</button></div>
+      </section>
+    </div>}
 
     <footer><span>Worldline Terminal API · Async mode</span><span>Showroom integration · Webhook callback</span></footer>
   </main>;
