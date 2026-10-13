@@ -55,6 +55,9 @@ export const cloudConfig = {
   adminPin: cleanEnv('ADMIN_PIN'),
   productsFile: process.env.PRODUCTS_FILE?.trim() || 'data/products.json',
   terminalSettingsFile: process.env.TERMINAL_SETTINGS_FILE?.trim() || 'data/cloud-terminals.json',
+  resendApiKey: cleanEnv('RESEND_API_KEY'),
+  captureEmailFrom: cleanEnv('CAPTURE_EMAIL_FROM'),
+  logWorldlinePayloads: process.env.WORLDLINE_LOG_PAYLOADS?.trim().toLowerCase() === 'true',
 };
 if (cloudConfig.adminPin && cloudConfig.adminPin.length < 6) throw new Error('ADMIN_PIN must be at least 6 characters.');
 if (new URL(cloudConfig.baseUrl).protocol !== 'https:') throw new Error('WORLDLINE_BASE_URL must use HTTPS.');

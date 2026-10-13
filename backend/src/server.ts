@@ -6,9 +6,28 @@ import { z } from 'zod';
 import { cloudConfig, safeTerminals, terminals, terminalConfigured, CloudTerminal } from './cloudConfig';
 import { makeAbortRequest, makeDeviceFeatureRequest, makeFinancialRequest, makePrintRequest, makeReconciliationRequest, worldlineRequest, WorldlineHttpError, WorldlineOperationKind } from './worldlineClient';
 import { deviceFeatureTemplates } from './deviceFeatures';
+import { getLogRecords, logEvent } from './structuredLog';
 
 const app = express();
 app.use(express.json({ limit: '512kb' }));
+
+// Log API metadata only. Do not log bodies, cookies or authorization headers: requests/responses
+// can contain JWTs, customer data, and payment receipt/card information.
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) { next(); return; }
+  const requestId = req.get('X-Request-ID') || randomUUID();
+  const startedAt = Date.now();
+  res.setHeader('X-Request-ID', requestId);
+  logEvent('http_api_request', { requestId, method: req.method, path: req.path });
+  res.on('finish', () => logEvent('http_api_response', {
+    requestId,
+    method: req.method,
+    path: req.path,
+    statusCode: res.statusCode,
+    durationMs: Date.now() - startedAt,
+  }));
+  next();
+});
 
 const moneySchema = z.object({
   terminalId: z.string().min(1),
@@ -18,7 +37,15 @@ const moneySchema = z.object({
   cashierId: z.string().trim().min(1).max(35).optional(),
 });
 const reversalSchema = z.object({ terminalId: z.string().min(1), receiptNumber: z.string().trim().min(1).max(64) });
-const reconciliationSchema = z.object({ terminalId: z.string().min(1) });
+const reconciliationSchema = z.object({
+  terminalId: z.string().min(1),
+  sendCaptureEmail: z.boolean().optional(),
+  captureEmail: z.string().trim().email().max(254).optional(),
+}).superRefine((value, context) => {
+  if (value.sendCaptureEmail && !value.captureEmail) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['captureEmail'], message: 'Enter an email address when capture-result email is enabled.' });
+  }
+});
 const printSchema = z.object({ terminalId: z.string().min(1), receiptData: z.string().trim().min(1).max(20000) });
 const deviceFeatureSchema = z.object({
   terminalId: z.string().min(1),
@@ -51,6 +78,7 @@ type Operation = {
   exchangeId: string;
   requestId?: string;
   abortRequestId?: string;
+  captureEmail?: string;
 };
 type SavedTransaction = {
   terminalId: string;
@@ -62,7 +90,7 @@ type SavedTransaction = {
 const operations = new Map<string, Operation>();
 const activeByTerminal = new Map<string, string>();
 const transactions = new Map<string, SavedTransaction[]>();
-const latestPayment = new Map<string, SavedTransaction>();
+const latestPayment = new Map<string, Record<string, any>>();
 const receiptCounters = new Map<string, number>();
 const failedAdminAttempts = new Map<string, { count: number; until: number }>();
 
@@ -71,7 +99,7 @@ function chosenTerminal(id: unknown): CloudTerminal | undefined {
   return terminals.length === 1 ? terminals[0] : undefined;
 }
 function publicOperation(operation: Operation) {
-  const { callbackToken: _secret, exchangeId: _exchange, ...safe } = operation;
+  const { callbackToken: _secret, exchangeId: _exchange, captureEmail: _email, ...safe } = operation;
   return safe;
 }
 function requireTerminal(id: unknown, res: Response): CloudTerminal | undefined {
@@ -161,19 +189,38 @@ app.put('/api/admin/products', requireAdmin, (req, res) => {
   }
 });
 
-// Display names and non-secret Nexo identity options are editable by a showroom admin.
-// UMID, UTID, and bearer JWT remain server environment secrets/configuration.
+// Full terminal settings are editable behind ADMIN_PIN. JWTs are stored server-side only;
+// the settings GET response exposes a configured flag, never the bearer token itself.
+// Full cloud terminal settings are editable behind ADMIN_PIN. JWTs are write-only over the API.
 const terminalDisplaySchema = z.array(z.object({
   id: z.string().min(1).max(32),
   name: z.string().trim().min(1).max(80),
   label: z.string().trim().min(1).max(80),
   initiatingParty: z.string().trim().min(1).max(35),
   poiId: z.string().trim().max(80),
+  umid: z.string().trim().max(128).optional(),
+  utid: z.string().trim().max(128).optional(),
+  jwt: z.string().trim().max(16384).optional(),
 })).min(1).max(50);
+const terminalSettingsInputSchema = z.array(z.object({
+  id: z.string().min(1).max(32),
+  name: z.string().trim().min(1).max(80),
+  label: z.string().trim().min(1).max(80),
+  initiatingParty: z.string().trim().min(1).max(35),
+  poiId: z.string().trim().max(80),
+  umid: z.string().trim().max(128),
+  utid: z.string().trim().max(128),
+  jwt: z.string().trim().max(16384).optional(),
+  clearJwt: z.boolean().optional(),
+})).min(1).max(50);
+type PersistedTerminalSettings = z.infer<typeof terminalDisplaySchema>[number];
 
 function publicTerminalSettings() {
-  return terminals.map(({ id, name, label, initiatingParty, poiId }) => ({
-    id, name, label, initiatingParty, poiId, configured: terminalConfigured(terminals.find(item => item.id === id)!),
+  return terminals.map(terminal => ({
+    id: terminal.id, name: terminal.name, label: terminal.label,
+    initiatingParty: terminal.initiatingParty, poiId: terminal.poiId,
+    umid: terminal.umid, utid: terminal.utid,
+    jwtConfigured: Boolean(terminal.jwt), configured: terminalConfigured(terminal),
   }));
 }
 function loadTerminalSettings() {
@@ -185,13 +232,14 @@ function loadTerminalSettings() {
   }
   for (const record of records) {
     const terminal = terminals.find(item => item.id === record.id)!;
-    terminal.name = record.name;
-    terminal.label = record.label;
-    terminal.initiatingParty = record.initiatingParty;
-    terminal.poiId = record.poiId;
+    terminal.name = record.name; terminal.label = record.label;
+    terminal.initiatingParty = record.initiatingParty; terminal.poiId = record.poiId;
+    if (record.umid !== undefined) terminal.umid = record.umid;
+    if (record.utid !== undefined) terminal.utid = record.utid;
+    if (record.jwt !== undefined) terminal.jwt = record.jwt;
   }
 }
-function saveTerminalSettings(records: z.infer<typeof terminalDisplaySchema>) {
+function saveTerminalSettings(records: PersistedTerminalSettings[]) {
   const output = path.resolve(process.cwd(), cloudConfig.terminalSettingsFile);
   mkdirSync(path.dirname(output), { recursive: true });
   const temp = `${output}.${process.pid}.tmp`;
@@ -203,24 +251,35 @@ app.get('/api/admin/terminals', requireAdmin, (_req, res) => res.json({ terminal
 app.put('/api/admin/terminals', requireAdmin, (req, res) => {
   if (activeByTerminal.size) { res.status(409).json({ error: 'Finish all active terminal operations before saving settings.' }); return; }
   try {
-    const records = terminalDisplaySchema.parse(req.body?.terminals);
-    const ids = records.map(record => record.id.toLowerCase());
+    const input = terminalSettingsInputSchema.parse(req.body?.terminals);
+    const ids = input.map(record => record.id.toLowerCase());
     if (new Set(ids).size !== ids.length || ids.length !== terminals.length || terminals.some(terminal => !ids.includes(terminal.id.toLowerCase()))) {
       res.status(400).json({ error: 'Keep the configured terminal IDs unchanged and include each terminal exactly once.' }); return;
     }
+    const records: PersistedTerminalSettings[] = input.map(({ clearJwt, jwt, ...record }) => {
+      const current = terminals.find(terminal => terminal.id === record.id)!;
+      return { ...record, jwt: clearJwt ? '' : (jwt?.trim() || current.jwt) };
+    });
     saveTerminalSettings(records);
     for (const record of records) {
       const terminal = terminals.find(item => item.id === record.id)!;
       terminal.name = record.name; terminal.label = record.label;
       terminal.initiatingParty = record.initiatingParty; terminal.poiId = record.poiId;
+      terminal.umid = record.umid ?? ''; terminal.utid = record.utid ?? ''; terminal.jwt = record.jwt ?? '';
     }
+    logEvent('terminal_settings_updated', { terminalIds: records.map(record => record.id), configuredCount: records.filter(record => Boolean(record.umid && record.utid && record.jwt)).length });
     res.json({ terminals: publicTerminalSettings() });
   } catch (error) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Invalid terminal settings.', details: error.issues.map(issue => ({ field: issue.path.join('.'), message: issue.message })) }); return;
     }
+    logEvent('terminal_settings_save_failed', { error: error instanceof Error ? error.message : 'unknown error' });
     res.status(400).json({ error: error instanceof Error ? error.message : 'Could not save terminal settings.' });
   }
+});
+
+app.get('/api/admin/logs', requireAdmin, (_req, res) => {
+  res.json({ exportedAt: new Date().toISOString(), records: getLogRecords() });
 });
 
 app.get('/api/operations/current', (req, res) => {
@@ -246,6 +305,12 @@ async function startOperation(kind: WorldlineOperationKind, req: Request, res: R
     const issues = error instanceof z.ZodError ? error.issues.map(issue => ({ field: issue.path.join('.'), message: issue.message })) : [];
     res.status(400).json({ error: 'Invalid operation request.', details: issues });
     return;
+  }
+  if (kind === 'reconciliation' && (input as z.infer<typeof reconciliationSchema>).sendCaptureEmail) {
+    if (!cloudConfig.resendApiKey || !cloudConfig.captureEmailFrom) {
+      res.status(503).json({ error: 'Capture email is enabled for this request, but RESEND_API_KEY and CAPTURE_EMAIL_FROM are not configured on the backend.' });
+      return;
+    }
   }
   const terminal = requireTerminal(input.terminalId, res);
   if (!terminal) return;
@@ -275,6 +340,9 @@ async function startOperation(kind: WorldlineOperationKind, req: Request, res: R
     createdAt: new Date().toISOString(),
     callbackToken,
     exchangeId: operationId,
+    ...(kind === 'reconciliation' && (input as z.infer<typeof reconciliationSchema>).sendCaptureEmail
+      ? { captureEmail: (input as z.infer<typeof reconciliationSchema>).captureEmail }
+      : {}),
   };
   let payload: unknown;
   try {
@@ -350,11 +418,11 @@ app.post('/api/operations/:operationId/abort', async (req, res) => {
     operation.abortRequestId = acknowledgement.data?.requestId;
     operation.state = 'abort-requested';
     operation.message = 'Worldline accepted the abort signal. This is not yet confirmation that the terminal cancelled; waiting for the final transaction webhook.';
-    console.info(JSON.stringify({ event: 'worldline_abort_accepted', operationId: operation.operationId, terminalId: operation.terminalId, targetExchangeId: operation.exchangeId, abortRequestId: operation.abortRequestId }));
+    logEvent('worldline_abort_accepted', { operationId: operation.operationId, terminalId: operation.terminalId, targetExchangeId: operation.exchangeId, abortRequestId: operation.abortRequestId });
     res.json(publicOperation(operation));
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Abort request failed.';
-    console.error(JSON.stringify({ event: 'worldline_abort_failed', operationId: operation.operationId, terminalId: operation.terminalId, error: message }));
+    logEvent('worldline_abort_failed', { operationId: operation.operationId, terminalId: operation.terminalId, error: message });
     res.status(error instanceof WorldlineHttpError ? error.status : 502).json({ error: message, operation: publicOperation(operation) });
   }
 });
@@ -371,7 +439,7 @@ app.post('/api/worldline/webhook', (req, res) => {
   }
   if (operation.state === 'completed') { res.status(200).json({ ok: true, duplicate: true }); return; }
   completeOperation(operation, req.body);
-  console.info(JSON.stringify({ event: 'worldline_webhook_completed', operationId, terminalId: operation.terminalId, kind: operation.kind, state: operation.state, outcome: operation.result?.transactionOutcome, detail: operation.result?.outcomeDescription }));
+  logEvent('worldline_webhook_completed', { operationId, terminalId: operation.terminalId, kind: operation.kind, state: operation.state, outcome: operation.result?.transactionOutcome, detail: operation.result?.outcomeDescription });
   res.status(200).json({ ok: true });
 });
 
@@ -384,6 +452,10 @@ function completeOperation(operation: Operation, envelope: any) {
   operation.requestId = envelope?.requestId ?? operation.requestId;
   if (activeByTerminal.get(operation.terminalId) === operation.operationId) activeByTerminal.delete(operation.terminalId);
 
+  // Latest payment means the latest completed payment attempt, regardless of its outcome.
+  // Reversal/receipt history below remains limited to approved payments with a usable transaction reference.
+  if (operation.kind === 'payment') latestPayment.set(operation.terminalId, result);
+
   if (operation.kind === 'payment' && result.transactionOutcome === 'Approved') {
     const original = result.originalTransaction;
     const list = transactions.get(operation.terminalId) ?? [];
@@ -395,7 +467,64 @@ function completeOperation(operation: Operation, envelope: any) {
     list.push(saved);
     if (list.length > 500) list.splice(0, list.length - 500);
     transactions.set(operation.terminalId, list);
-    latestPayment.set(operation.terminalId, saved);
+  }
+  if (operation.kind === 'reconciliation' && operation.captureEmail && operation.result) {
+    operation.result.captureEmail = { status: 'sending' };
+    void sendCaptureResultEmail(operation);
+  }
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]!));
+}
+function redactCaptureEmailValue(value: any): any {
+  if (Array.isArray(value)) return value.map(redactCaptureEmailValue);
+  if (value && typeof value === 'object') {
+    const clean: Record<string, any> = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (key.toLowerCase() === 'callbacktoken' || key.toLowerCase() === 'authorization') clean[key] = '[REDACTED]';
+      else clean[key] = redactCaptureEmailValue(item);
+    }
+    return clean;
+  }
+  if (typeof value === 'string' && value.startsWith('https://') && value.includes('callbackToken=')) {
+    try {
+      const url = new URL(value);
+      if (url.searchParams.has('callbackToken')) url.searchParams.set('callbackToken', '[REDACTED]');
+      return url.toString();
+    } catch { return value.replace(/([?&]callbackToken=)[^&]+/gi, '$1[REDACTED]'); }
+  }
+  return value;
+}
+async function sendCaptureResultEmail(operation: Operation) {
+  const terminal = terminals.find(item => item.id === operation.terminalId);
+  if (!terminal || !operation.captureEmail || !operation.result) return;
+  const json = JSON.stringify(redactCaptureEmailValue(operation.result.worldlineResponse ?? operation.result), null, 2);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cloudConfig.resendApiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: cloudConfig.captureEmailFrom,
+        to: [operation.captureEmail],
+        subject: `Worldline capture result — ${terminal.label} — ${operation.createdAt}`,
+        text: `Worldline capture/reconciliation result for ${terminal.label}.\n\n${json}`,
+        html: `<p>Worldline capture/reconciliation result for <strong>${escapeHtml(terminal.label)}</strong>.</p><pre style="white-space:pre-wrap">${escapeHtml(json)}</pre>`,
+        attachments: [{ filename: `worldline-capture-${operation.operationId}.json`, content: Buffer.from(json, 'utf8').toString('base64') }],
+      }),
+      signal: controller.signal,
+    });
+    const responseText = await response.text();
+    if (!response.ok) throw new Error(`Mail provider HTTP ${response.status}${responseText ? `: ${responseText.slice(0, 250)}` : ''}`);
+    operation.result.captureEmail = { status: 'sent', sentAt: new Date().toISOString() };
+    logEvent('capture_result_email_sent', { operationId: operation.operationId, terminalId: operation.terminalId });
+  } catch (error) {
+    operation.result.captureEmail = { status: 'failed', message: error instanceof Error && error.name === 'AbortError' ? 'Email provider request timed out.' : error instanceof Error ? error.message : 'Email delivery failed.' };
+    logEvent('capture_result_email_failed', { operationId: operation.operationId, terminalId: operation.terminalId, errorType: error instanceof Error && error.name === 'AbortError' ? 'timeout' : 'provider_error' });
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -468,8 +597,8 @@ app.get('/api/payments/latest', (req, res) => {
   if (!terminal) { res.status(400).json({ error: 'Select a configured terminal.' }); return; }
   if (activeByTerminal.has(terminal.id)) { res.status(409).json({ error: 'Payment lookup is unavailable while this terminal has an active operation.' }); return; }
   const latest = latestPayment.get(terminal.id);
-  if (!latest) { res.status(404).json({ error: 'No completed showroom payment is available in this backend session.' }); return; }
-  res.json(latest.result);
+  if (!latest) { res.status(404).json({ error: 'No completed payment attempt is available in this backend session.' }); return; }
+  res.json(latest);
 });
 app.get('/api/payments/:receiptNumber', (req, res) => {
   const terminal = chosenTerminal(req.query.terminalId);

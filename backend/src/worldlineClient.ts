@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { CloudTerminal, cloudConfig, terminalConfigured } from './cloudConfig';
+import { logEvent, redactForLog } from './structuredLog';
 
 export type WorldlineOperationKind = 'payment' | 'refund' | 'reversal' | 'reconciliation' | 'print' | 'device';
 
@@ -32,10 +33,17 @@ function apiPath(terminal: CloudTerminal, endpoint: string): string {
 
 export async function worldlineRequest<T = any>(terminal: CloudTerminal, endpoint: string, payload: unknown): Promise<{ status: number; data: T }> {
   const path = apiPath(terminal, endpoint);
+  const requestId = randomUUID();
+  const exchangeId = (payload as any)?.SaleToPOIServiceRequest?.Header?.ExchangeIdentification
+    ?? (payload as any)?.SaleToPOIReconciliationRequest?.Header?.ExchangeIdentification
+    ?? (payload as any)?.SaleToPOIDeviceRequest?.Header?.ExchangeIdentification
+    ?? (payload as any)?.SaleToPOIAbort?.Header?.ExchangeIdentification;
   const controller = new AbortController();
+  const startedAt = Date.now();
   const timer = setTimeout(() => controller.abort(), cloudConfig.requestTimeoutMs);
   let response: Response;
   let text: string;
+  logEvent('worldline_api_request', { requestId, method: 'POST', endpoint, url: `${cloudConfig.baseUrl}${path}`, terminalId: terminal.id, ...(exchangeId ? { exchangeId } : {}), ...(cloudConfig.logWorldlinePayloads ? { requestPayload: redactForLog(payload) } : {}) });
   try {
     response = await fetch(`${cloudConfig.baseUrl}${path}`, {
       method: 'POST',
@@ -43,15 +51,22 @@ export async function worldlineRequest<T = any>(terminal: CloudTerminal, endpoin
         Authorization: `Bearer ${tokenFor(terminal)}`,
         Accept: 'application/json',
         'Content-Type': 'application/json',
-        'X-Request-ID': randomUUID(),
+        'X-Request-ID': requestId,
         'User-Agent': 'Worldline-Showroom-ECR/1.0',
       },
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
     text = await response.text();
+    let responsePayload: unknown = text;
+    if (text) {
+      try { responsePayload = JSON.parse(text); } catch { /* Preserve non-JSON error text for opt-in troubleshooting. */ }
+    }
+    logEvent('worldline_api_response', { requestId, method: 'POST', endpoint, url: `${cloudConfig.baseUrl}${path}`, terminalId: terminal.id, statusCode: response.status, durationMs: Date.now() - startedAt, ...(cloudConfig.logWorldlinePayloads ? { responsePayload: redactForLog(responsePayload) } : {}) });
   } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') throw new Error('Worldline API request timed out; the terminal outcome may be unknown. Do not retry until resolved.');
+    const timedOut = error instanceof Error && error.name === 'AbortError';
+    logEvent('worldline_api_transport_error', { requestId, method: 'POST', endpoint, terminalId: terminal.id, durationMs: Date.now() - startedAt, errorType: timedOut ? 'timeout' : 'network_error' });
+    if (timedOut) throw new Error('Worldline API request timed out; the terminal outcome may be unknown. Do not retry until resolved.');
     throw new Error('Could not reach the Worldline API; the terminal outcome may be unknown. Do not retry until resolved.');
   } finally {
     clearTimeout(timer);
