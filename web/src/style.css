@@ -568,3 +568,43 @@
   .cart-card > .checkout-button { flex:none; min-height:46px; height:46px; }
   .cart-card > .latest-card, .cart-card > .status-card { flex:none; height:auto; min-height:0; max-height:35vh; }
 }
+
+
+/* Tablet cart composition: checkout is fixed; receipt and live status share the remaining area. */
+@media (min-width: 761px) and (min-height: 680px) {
+  .product-layout, .product-layout > .cart-card { min-height: 0; }
+  .product-layout > .cart-card { display:flex; flex-direction:column; height:100%; min-height:0; overflow:hidden; gap:0; }
+  .cart-card > .card-title { flex:0 0 auto; margin-bottom:6px; }
+  .cart-card > .empty-cart { flex:0 0 44px; height:44px; min-height:44px; }
+  .cart-card > .cart-lines { flex:0 0 auto; height:clamp(34px,7vh,60px); max-height:clamp(34px,7vh,60px); min-height:0; overflow-y:auto; overscroll-behavior:contain; }
+  .cart-card > .cart-total { flex:0 0 36px; height:36px; padding:4px 0 0; margin-top:3px; }
+  .cart-card > .checkout-button { flex:0 0 44px; min-height:44px; height:44px; margin:6px 0 0; }
+  .cart-card > .latest-card { flex:1 1 0; min-width:0; min-height:0; max-height:none; width:100%; margin:6px 0 0; padding:7px 9px; overflow:hidden; align-content:start; }
+  .cart-card > .latest-card .latest-copy h3 { margin-top:1px; font-size:13px; }
+  .cart-card > .latest-card .latest-copy p { margin-top:2px; font-size:9px; line-height:1.2; }
+  .cart-card > .latest-card .secondary { flex:0 0 auto; min-height:27px; height:27px; padding:0 7px; font-size:10px; }
+  .cart-card > .latest-card .latest-result { min-height:0; padding-top:2px; overflow:hidden; }
+  .cart-card > .latest-card .meta-row { padding:2px 0; }
+  .cart-card > .latest-card .receipt-actions { min-width:0; padding-top:3px; gap:3px; overflow:hidden; }
+  .cart-card > .latest-card .receipt-buttons { gap:3px; }
+  .cart-card > .latest-card .receipt-buttons .secondary { flex:0 0 auto; min-height:24px; height:24px; padding:0 5px; font-size:9px; }
+  .cart-card > .security-note { flex:0 0 auto; margin-top:3px; font-size:8px; line-height:1.1; }
+  .cart-card > .status-card { flex:2 1 0; min-width:0; min-height:0; max-height:none; margin:5px 0 0; padding:7px 9px; overflow:hidden; }
+  .cart-card > .status-card .card-title { margin-bottom:3px; }
+  .cart-card > .status-card .card-title h3 { font-size:13px; }
+  .cart-card > .status-card .empty-state { height:38px; min-height:38px; }
+  .cart-card > .status-card .empty-icon { display:none; }
+  .cart-card > .status-card .state-banner { padding:4px 6px; margin:0 0 3px; }
+  .cart-card > .status-card .meta-row { padding:2px 0; }
+  .cart-card > .status-card .result-box { min-height:0; margin-top:3px; padding:4px; overflow:hidden; }
+  .cart-card > .status-card .result-box details { max-height:42px; overflow:auto; }
+  .cart-card > .status-card .result-box pre { max-height:30px; }
+  .cart-card > .status-card .abort { flex:0 0 auto; margin-top:4px; padding:5px 7px; }
+}
+@media (min-width: 761px) and (min-height: 560px) and (max-height: 679px) {
+  html, body, #root { height:auto; min-height:100%; overflow:auto; }
+  .shell { height:auto; max-height:none; min-height:100vh; overflow:visible; }
+  .product-layout, .product-layout > .cart-card { height:auto; overflow:visible; }
+  .cart-card > .checkout-button { flex:none; min-height:46px; height:46px; }
+  .cart-card > .latest-card, .cart-card > .status-card { flex:none; height:auto; min-height:0; max-height:none; overflow:visible; }
+}
