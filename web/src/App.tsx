@@ -34,15 +34,79 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
+function renderJsonReceiptLines(lines: JsonReceiptLine[]): string {
+  const result: string[] = [];
+  let line = '';
+  for (const item of lines) {
+    const text = String(item.Text ?? '');
+    if (item.Alignment === 'Right' && line) line += `  ${text}`;
+    else if (item.Alignment === 'Right') line = text;
+    else line += text;
+    if (item.EndOfLineFlag !== false) { result.push(line); line = ''; }
+  }
+  if (line) result.push(line);
+  return result.join('\n');
+}
+
+function receiptFromWrappedJson(value: unknown, audience: 'customer' | 'merchant'): string | undefined {
+  let parsed: any = value;
+  if (typeof parsed === 'string') {
+    try { parsed = JSON.parse(parsed.trim()); } catch { return undefined; }
+  }
+  if (Array.isArray(parsed)) {
+    const combined = parsed.map((item: any) => String(item?.Text ?? '')).join('');
+    try { parsed = JSON.parse(combined.trim()); } catch { return undefined; }
+  }
+  if (!parsed || typeof parsed !== 'object' || !parsed.receiptTargets || !parsed.additionalData) return undefined;
+
+  const additional = new Map<string, string>();
+  if (Array.isArray(parsed.additionalData)) {
+    for (const item of parsed.additionalData) {
+      if (item && typeof item.key === 'string') additional.set(item.key.toLowerCase(), String(item.value ?? ''));
+    }
+  } else if (typeof parsed.additionalData === 'object') {
+    for (const [key, entry] of Object.entries(parsed.additionalData)) {
+      additional.set(key.toLowerCase(), String((entry as any)?.value ?? entry ?? ''));
+    }
+  }
+
+  const suffixes = audience === 'merchant' ? ['merchant', 'cashier'] : ['customer', 'client', 'cardholder'];
+  const readPart = (part: 'header' | 'content' | 'footer') => {
+    for (const suffix of suffixes) {
+      const value = additional.get(`receip${part}${suffix}`) ?? additional.get(`receipt${part}${suffix}`);
+      if (value) return value;
+    }
+    return '';
+  };
+  const output = [readPart('header'), readPart('content'), readPart('footer')].filter(Boolean).join('\n');
+  return output || undefined;
+}
+
 function getReceiptContent(response: any, source: string): ReceiptToPrint | null {
   const receipt = response?.receipt;
   if (!receipt) return null;
   const customer = receipt.customer ?? {};
   const merchant = receipt.merchant ?? {};
-  const embedded = customer.embeddedPlain ?? merchant.embeddedPlain;
-  const plain = customer.plain ?? merchant.plain ?? (embedded ? [embedded.header, embedded.content, embedded.footer].filter(Boolean).join('\n') : undefined);
-  const printerCommands = customer.escpos ?? merchant.escpos;
-  const outputJSON = customer.json ?? merchant.json;
+  const customerJson = Array.isArray(customer.json) ? customer.json as JsonReceiptLine[] : undefined;
+  const merchantJson = Array.isArray(merchant.json) ? merchant.json as JsonReceiptLine[] : undefined;
+  const customerEmbedded = customer.embeddedPlain;
+  const merchantEmbedded = merchant.embeddedPlain;
+  const customerText = receiptFromWrappedJson(customer.plain, 'customer')
+    ?? receiptFromWrappedJson(customerJson, 'customer')
+    ?? customer.plain
+    ?? (customerEmbedded ? [customerEmbedded.header, customerEmbedded.content, customerEmbedded.footer].filter(Boolean).join('\n') : undefined)
+    ?? (customerJson ? renderJsonReceiptLines(customerJson) : undefined);
+  const merchantText = receiptFromWrappedJson(merchant.plain, 'merchant')
+    ?? receiptFromWrappedJson(merchantJson, 'merchant')
+    ?? merchant.plain
+    ?? (merchantEmbedded ? [merchantEmbedded.header, merchantEmbedded.content, merchantEmbedded.footer].filter(Boolean).join('\n') : undefined)
+    ?? (merchantJson ? renderJsonReceiptLines(merchantJson) : undefined);
+  const wrappedJson = Boolean(receiptFromWrappedJson(customer.plain, 'customer') ?? receiptFromWrappedJson(customerJson, 'customer') ?? receiptFromWrappedJson(merchant.plain, 'merchant') ?? receiptFromWrappedJson(merchantJson, 'merchant'));
+  const plain = customerText ?? merchantText;
+  // When OutputJSON is actually serialized transaction JSON (rather than printer rows), print
+  // the extracted receipt text and let the backend format it instead of printing the JSON blob.
+  const outputJSON = wrappedJson ? undefined : (customerJson ?? merchantJson);
+  const printerCommands = wrappedJson ? plain : (customer.escpos ?? merchant.escpos ?? plain);
   if (!plain && !printerCommands && !outputJSON?.length) return null;
   return { receiptNumber: response.receiptNumber, plain, printerCommands, outputJSON, source };
 }
@@ -188,14 +252,9 @@ export default function App() {
   const responseCurrency = result?.amounts?.currency?.symbol ?? result?.amounts?.currencySymbol;
 
   useEffect(() => {
-    if (operation?.state === 'completed') {
+    if (operation?.state === 'completed' && operation.kind !== 'payment') {
       const content = getReceiptContent(operation.result, `${labels[operation.kind]} response`);
       if (content && selectedTerminalRef.current === operation.terminalId) setReceiptToPrint(content);
-      if (operation.kind === 'payment') {
-        setLatest(operation.result ?? null);
-        setLatestError('');
-        setReceiptToPrint(getReceiptContent(operation.result, 'Latest payment attempt'));
-      }
     }
   }, [operation?.state, operation?.operationId, operation?.terminalId, operation?.kind, operation?.result]);
 
