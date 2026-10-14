@@ -4,7 +4,7 @@ import path from 'node:path';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { z } from 'zod';
 import { cloudConfig, safeTerminals, terminals, terminalConfigured, CloudTerminal } from './cloudConfig';
-import { makeAbortRequest, makeDeviceFeatureRequest, makeFinancialRequest, makePrintRequest, makeReconciliationRequest, worldlineRequest, WorldlineHttpError, WorldlineOperationKind } from './worldlineClient';
+import { makeAbortRequest, makeDeviceFeatureRequest, makeFinancialRequest, makePrintRequest, makeReconciliationRequest, receiptTextToJson, worldlineRequest, WorldlineHttpError, WorldlineOperationKind } from './worldlineClient';
 import type { JsonReceiptLine } from './worldlineClient';
 import { deviceFeatureTemplates } from './deviceFeatures';
 import { getLogRecords, logEvent, redactForLog } from './structuredLog';
@@ -564,6 +564,81 @@ function renderJsonReceipt(lines: any[]): string {
   return rendered.join('\n');
 }
 
+type ReceiptSections = { header: string; content: string; footer: string };
+
+function extractReceiptTargetSections(output: any, audience: 'customer' | 'merchant'): ReceiptSections | undefined {
+  const parseCandidate = (candidate: any): any => {
+    if (Array.isArray(candidate)) {
+      const serialized = candidate.map((entry: any) => String(entry?.Text ?? '')).join('');
+      try { return JSON.parse(serialized.trim()); } catch { return undefined; }
+    }
+    if (typeof candidate === 'string') {
+      try { return JSON.parse(candidate.trim()); } catch { return undefined; }
+    }
+    return candidate && typeof candidate === 'object' ? candidate : undefined;
+  };
+
+  const parsed = parseCandidate(output?.MessageContent) ?? parseCandidate(output?.OutputJSON);
+  if (!parsed || typeof parsed !== 'object' || !parsed.receiptTargets || !parsed.additionalData) return undefined;
+
+  const additional = new Map<string, string>();
+  if (Array.isArray(parsed.additionalData)) {
+    for (const entry of parsed.additionalData) {
+      if (entry && typeof entry.key === 'string') {
+        additional.set(entry.key.toLowerCase().replace(/[^a-z0-9]/g, ''), String(entry.value ?? ''));
+      }
+    }
+  } else if (typeof parsed.additionalData === 'object') {
+    for (const [key, entry] of Object.entries(parsed.additionalData)) {
+      additional.set(key.toLowerCase().replace(/[^a-z0-9]/g, ''), String((entry as any)?.value ?? entry ?? ''));
+    }
+  }
+
+  const suffixes = audience === 'merchant' ? ['merchant', 'cashier'] : ['customer', 'client', 'cardholder'];
+  const readPart = (part: 'header' | 'content' | 'footer') => {
+    for (const suffix of suffixes) {
+      const value = additional.get(`receipt${part}${suffix}`);
+      if (value !== undefined) return value;
+    }
+    return '';
+  };
+  const sections = { header: readPart('header'), content: readPart('content'), footer: readPart('footer') };
+  return sections.header || sections.content || sections.footer ? sections : undefined;
+}
+
+function wrapCenteredReceiptHeader(text: string, width = 32): JsonReceiptLine[] {
+  const result: JsonReceiptLine[] = [];
+  for (const raw of text.replace(/\r\n?/g, '\n').split('\n')) {
+    let remaining = raw.trim();
+    if (!remaining) {
+      result.push({ CharacterStyle: 'Normal', Alignment: 'Centred', EndOfLineFlag: true, Text: '' });
+      continue;
+    }
+    while (remaining.length > width) {
+      let splitAt = remaining.lastIndexOf(' ', width);
+      if (splitAt < Math.floor(width * 0.55)) splitAt = width;
+      result.push({ CharacterStyle: 'Normal', Alignment: 'Centred', EndOfLineFlag: true, Text: remaining.slice(0, splitAt).trimEnd() });
+      remaining = remaining.slice(splitAt).trimStart();
+    }
+    result.push({ CharacterStyle: 'Normal', Alignment: 'Centred', EndOfLineFlag: true, Text: remaining });
+  }
+  return result;
+}
+
+function receiptSectionsToJson(sections: ReceiptSections): JsonReceiptLine[] {
+  const rows: JsonReceiptLine[] = [];
+  if (sections.header) rows.push(...wrapCenteredReceiptHeader(sections.header));
+  if (sections.header && sections.content) rows.push({ CharacterStyle: 'Normal', Alignment: 'Left', EndOfLineFlag: true, Text: '' });
+  if (sections.content) rows.push(...receiptTextToJson(sections.content));
+  if (sections.content && sections.footer) rows.push({ CharacterStyle: 'Normal', Alignment: 'Left', EndOfLineFlag: true, Text: '' });
+  if (sections.footer) rows.push(...wrapCenteredReceiptHeader(sections.footer));
+  return rows;
+}
+
+function renderReceiptSections(sections: ReceiptSections): string {
+  return [sections.header, sections.content, sections.footer].filter(section => section.length > 0).join('\n');
+}
+
 function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string, any> {
   const isRejection = Boolean(raw?.SaleToPOIMessageRejection);
   const service = raw?.SaleToPOIServiceResponse?.ServiceResponse ?? {};
@@ -592,10 +667,14 @@ function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string,
   const merchantReceipt = receiptList.find((item: any) => item?.DocumentQualifier === 'CashierReceipt');
   const customerOutput = customerReceipt?.OutputContent ?? {};
   const merchantOutput = merchantReceipt?.OutputContent ?? {};
-  const customerJson = customerOutput?.Format === 'JSON' && Array.isArray(customerOutput?.OutputJSON) ? customerOutput.OutputJSON : undefined;
-  const merchantJson = merchantOutput?.Format === 'JSON' && Array.isArray(merchantOutput?.OutputJSON) ? merchantOutput.OutputJSON : undefined;
-  const customerText = customerOutput?.MessageContent ?? (customerJson ? renderJsonReceipt(customerJson) : undefined);
-  const merchantText = merchantOutput?.MessageContent ?? (merchantJson ? renderJsonReceipt(merchantJson) : undefined);
+  const customerOriginalJson = customerOutput?.Format === 'JSON' && Array.isArray(customerOutput?.OutputJSON) ? customerOutput.OutputJSON : undefined;
+  const merchantOriginalJson = merchantOutput?.Format === 'JSON' && Array.isArray(merchantOutput?.OutputJSON) ? merchantOutput.OutputJSON : undefined;
+  const customerWrappedSections = extractReceiptTargetSections(customerOutput, 'customer');
+  const merchantWrappedSections = extractReceiptTargetSections(merchantOutput, 'merchant');
+  const customerJson = customerWrappedSections ? receiptSectionsToJson(customerWrappedSections) : customerOriginalJson;
+  const merchantJson = merchantWrappedSections ? receiptSectionsToJson(merchantWrappedSections) : merchantOriginalJson;
+  const customerText = customerWrappedSections ? renderReceiptSections(customerWrappedSections) : customerOutput?.MessageContent ?? (customerJson ? renderJsonReceipt(customerJson) : undefined);
+  const merchantText = merchantWrappedSections ? renderReceiptSections(merchantWrappedSections) : merchantOutput?.MessageContent ?? (merchantJson ? renderJsonReceipt(merchantJson) : undefined);
   const originalId = payment?.POITransactionIdentification ?? paymentTransaction?.POITransactionIdentification;
   const totalAmount = retailerResult?.RequestedTransaction?.TransactionDetails?.TotalAmount
     ?? paymentTransaction?.TransactionDetails?.TotalAmount
