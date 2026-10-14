@@ -113,8 +113,19 @@ function makeHeader(terminal: CloudTerminal, operationId: string, webhookUrl: st
   };
 }
 
-function environment(terminal: CloudTerminal) {
-  return terminal.poiId ? { POI: { Identification: { Identification: terminal.poiId } } } : {};
+function environment(terminal: CloudTerminal, requestJsonReceipt = false) {
+  // POI Identification is required by the API whenever Environment.POI is present.
+  // Without a configured POI ID, omit JSON-format negotiation and use the default receipt format.
+  if (!terminal.poiId) return {};
+  return {
+    POI: {
+      Identification: { Identification: terminal.poiId },
+      ...(requestJsonReceipt ? { Capabilities: { MessageCapabilities: [
+        { Destination: ['CardholderReceipt'], AvailableFormat: ['JSON'] },
+        { Destination: ['MerchantReceipt'], AvailableFormat: ['JSON'] },
+      ] } } : {}),
+    },
+  };
 }
 
 export function makeFinancialRequest(
@@ -158,7 +169,7 @@ export function makeFinancialRequest(
     SaleToPOIServiceRequest: {
       Header: header,
       ServiceRequest: {
-        Environment: environment(terminal),
+        Environment: environment(terminal, true),
         ServiceContent: 'FinancialPaymentRequest',
         PaymentRequest: {
           PaymentTransaction: {
@@ -257,13 +268,22 @@ export function makeDeviceFeatureRequest(
   };
 }
 
-export function makePrintRequest(terminal: CloudTerminal, operationId: string, callbackToken: string, text: string) {
+export type JsonReceiptLine = {
+  CharacterStyle?: 'Normal' | 'Bold';
+  Alignment?: 'Left' | 'Right' | 'Centred';
+  EndOfLineFlag?: boolean;
+  Text?: string;
+  FontSize?: number;
+};
+
+export function makePrintRequest(terminal: CloudTerminal, operationId: string, callbackToken: string, text?: string, outputJSON?: JsonReceiptLine[]) {
+  const jsonLines = outputJSON?.length ? outputJSON : receiptTextToJson(text ?? '');
   return {
     SaleToPOIDeviceRequest: {
       Header: makeHeader(terminal, operationId, createWebhookUrl(operationId, callbackToken), 'DeviceRequest'),
       DeviceRequest: {
         Environment: environment(terminal),
-        PrintRequest: { OutputContent: { Format: 'JSON', OutputJSON: receiptTextToJson(text) } },
+        PrintRequest: { OutputContent: { Format: 'JSON', OutputJSON: jsonLines } },
       },
     },
   };

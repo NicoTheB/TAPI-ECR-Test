@@ -46,7 +46,8 @@ const reconciliationSchema = z.object({
     context.addIssue({ code: z.ZodIssueCode.custom, path: ['captureEmail'], message: 'Enter an email address when capture-result email is enabled.' });
   }
 });
-const printSchema = z.object({ terminalId: z.string().min(1), receiptData: z.string().trim().min(1).max(20000) });
+const jsonReceiptLineSchema = z.object({ CharacterStyle: z.enum(['Normal', 'Bold']).optional(), Alignment: z.enum(['Left', 'Right', 'Centred']).optional(), EndOfLineFlag: z.boolean().optional(), Text: z.string().max(2000).optional(), FontSize: z.number().int().min(1).max(128).optional() });
+const printSchema = z.object({ terminalId: z.string().min(1), receiptData: z.string().trim().min(1).max(20000).optional(), outputJSON: z.array(jsonReceiptLineSchema).min(1).max(500).optional() }).refine(value => Boolean(value.receiptData || value.outputJSON?.length), 'Provide receipt text or JSON receipt lines.');
 const deviceFeatureSchema = z.object({
   terminalId: z.string().min(1),
   featureId: z.string().min(1).max(80),
@@ -365,7 +366,8 @@ async function startOperation(kind: WorldlineOperationKind, req: Request, res: R
       }
       payload = makeDeviceFeatureRequest(terminal, operationId, callbackToken, deviceInput.deviceRequest);
     } else {
-      payload = makePrintRequest(terminal, operationId, callbackToken, (input as z.infer<typeof printSchema>).receiptData);
+      const printInput = input as z.infer<typeof printSchema>;
+      payload = makePrintRequest(terminal, operationId, callbackToken, printInput.receiptData, printInput.outputJSON);
     }
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : 'Could not prepare Worldline request.' });
@@ -550,6 +552,17 @@ async function sendCaptureResultEmail(operation: Operation) {
   }
 }
 
+function renderJsonReceipt(lines: any[]): string {
+  let current = '';
+  const rendered: string[] = [];
+  for (const line of lines) {
+    current += String(line?.Text ?? '');
+    if (line?.EndOfLineFlag !== false) { rendered.push(current); current = ''; }
+  }
+  if (current) rendered.push(current);
+  return rendered.join('\n');
+}
+
 function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string, any> {
   const isRejection = Boolean(raw?.SaleToPOIMessageRejection);
   const service = raw?.SaleToPOIServiceResponse?.ServiceResponse ?? {};
@@ -576,8 +589,12 @@ function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string,
   const receiptList = Array.isArray(sourceReceipt) ? sourceReceipt : [sourceReceipt];
   const customerReceipt = receiptList.find((item: any) => item?.DocumentQualifier === 'CustomerReceipt');
   const merchantReceipt = receiptList.find((item: any) => item?.DocumentQualifier === 'CashierReceipt');
-  const customerText = customerReceipt?.OutputContent?.MessageContent;
-  const merchantText = merchantReceipt?.OutputContent?.MessageContent;
+  const customerOutput = customerReceipt?.OutputContent ?? {};
+  const merchantOutput = merchantReceipt?.OutputContent ?? {};
+  const customerJson = customerOutput?.Format === 'JSON' && Array.isArray(customerOutput?.OutputJSON) ? customerOutput.OutputJSON : undefined;
+  const merchantJson = merchantOutput?.Format === 'JSON' && Array.isArray(merchantOutput?.OutputJSON) ? merchantOutput.OutputJSON : undefined;
+  const customerText = customerOutput?.MessageContent ?? (customerJson ? renderJsonReceipt(customerJson) : undefined);
+  const merchantText = merchantOutput?.MessageContent ?? (merchantJson ? renderJsonReceipt(merchantJson) : undefined);
   const originalId = payment?.POITransactionIdentification ?? paymentTransaction?.POITransactionIdentification;
   const totalAmount = retailerResult?.RequestedTransaction?.TransactionDetails?.TotalAmount
     ?? paymentTransaction?.TransactionDetails?.TotalAmount
@@ -603,7 +620,7 @@ function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string,
     ...(paymentTransaction?.TransactionResponse?.AuthorisationResult?.AuthorisationCode ? { approvalCode: paymentTransaction.TransactionResponse.AuthorisationResult.AuthorisationCode } : {}),
     ...(identifier?.TransactionReference ? { transactionReference: identifier.TransactionReference } : {}),
     ...(originalId?.TransactionDateTime && originalId?.TransactionReference ? { originalTransaction: { TransactionDateTime: originalId.TransactionDateTime, TransactionReference: originalId.TransactionReference } } : {}),
-    ...(customerText || merchantText ? { receipt: { customer: { ...(customerText ? { plain: customerText, escpos: customerText } : {}) }, merchant: { ...(merchantText ? { plain: merchantText, escpos: merchantText } : {}) } } } : {}),
+    ...(customerText || merchantText ? { receipt: { customer: { ...(customerText ? { plain: customerText, escpos: customerText } : {}), ...(customerJson ? { json: customerJson } : {}) }, merchant: { ...(merchantText ? { plain: merchantText, escpos: merchantText } : {}), ...(merchantJson ? { json: merchantJson } : {}) } } } : {}),
     ...(kind === 'reconciliation' && merchantText ? { receipt: { customer: { plain: merchantText, escpos: merchantText }, merchant: { plain: merchantText, escpos: merchantText } } } : {}),
     ...(kind === 'print' ? { printResult: isRejection || (deviceStatus && !['success', 'successful'].includes(String(deviceStatus).toLowerCase())) ? 'Failed' : 'Success' } : {}),
     ...(kind === 'device' ? { deviceResult: isRejection || (deviceStatus && !['success', 'successful'].includes(String(deviceStatus).toLowerCase())) ? 'Failed' : 'Success' } : {}),
