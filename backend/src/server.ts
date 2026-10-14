@@ -81,6 +81,8 @@ type Operation = {
   requestId?: string;
   abortRequestId?: string;
   captureEmail?: string;
+  requestedAmountMinor?: number;
+  requestedCurrency?: string;
 };
 type SavedTransaction = {
   terminalId: string;
@@ -346,6 +348,10 @@ async function startOperation(kind: WorldlineOperationKind, req: Request, res: R
     ...(kind === 'reconciliation' && (input as z.infer<typeof reconciliationSchema>).sendCaptureEmail
       ? { captureEmail: (input as z.infer<typeof reconciliationSchema>).captureEmail }
       : {}),
+    ...(kind === 'payment' || kind === 'refund' ? {
+      requestedAmountMinor: (input as z.infer<typeof moneySchema>).amount,
+      requestedCurrency: (input as z.infer<typeof moneySchema>).currencySymbol,
+    } : {}),
   };
   let payload: unknown;
   try {
@@ -471,6 +477,36 @@ app.post('/api/worldline/webhook', (req, res) => {
 function completeOperation(operation: Operation, envelope: any) {
   const raw = envelope?.data ?? envelope ?? null;
   const result = normalizeResult(operation.kind, raw);
+  if (operation.kind === 'payment' && !result.receipt && ['Declined', 'Cancelled'].includes(result.transactionOutcome)) {
+    const status = result.transactionOutcome === 'Cancelled' ? 'CANCELLED' : 'DECLINED';
+    const amountMajor = operation.requestedAmountMinor !== undefined ? operation.requestedAmountMinor / 100 : undefined;
+    const amountText = amountMajor !== undefined
+      ? `Amount: ${operation.requestedCurrency ?? ''} ${amountMajor.toFixed(2)}`.trim()
+      : '';
+    const reason = result.outcomeDescription ? `Reason: ${String(result.outcomeDescription)}` : '';
+    const slip = [
+      'PAYMENT NOT COMPLETED',
+      status,
+      'NO PAYMENT TAKEN',
+      amountText,
+      reason,
+      'SHOWROOM STATUS SLIP',
+      'Not an official terminal receipt',
+    ].filter(Boolean).join('\n');
+    result.receiptStatusSlip = true;
+    result.receipt = {
+      customer: { plain: slip, escpos: slip },
+      merchant: { plain: slip, escpos: slip },
+    };
+  }
+  if (operation.kind === 'payment' && !result.amounts && operation.requestedAmountMinor !== undefined) {
+    result.amounts = {
+      base: operation.requestedAmountMinor,
+      total: operation.requestedAmountMinor / 100,
+      currency: { symbol: operation.requestedCurrency ?? '' },
+      currencySymbol: operation.requestedCurrency,
+    };
+  }
   operation.result = result;
   operation.state = 'completed';
   operation.message = undefined;

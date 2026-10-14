@@ -201,56 +201,64 @@ export function makeReconciliationRequest(terminal: CloudTerminal, operationId: 
 // rows as a left-aligned label plus a right-aligned value on the same printer line.
 export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceiptLine[] {
   const output: JsonReceiptLine[] = [];
-  const appendLine = (value: string, alignment: JsonReceiptLine['Alignment']) => {
-    if (!value) {
-      output.push({ CharacterStyle: 'Normal', Alignment: alignment, EndOfLineFlag: true, Text: '' });
-      return;
-    }
-
-    // Wrap at word boundaries instead of slicing at a fixed character offset. Fixed slicing
-    // split DCC disclaimer words (for example "pay" into "p" + "ay") on the receipt.
+  const addLine = (text: string, alignment: JsonReceiptLine['Alignment'], fontSize?: number, style: JsonReceiptLine['CharacterStyle'] = 'Normal', eol = true) => {
+    output.push({ CharacterStyle: style, Alignment: alignment, EndOfLineFlag: eol, Text: text, ...(fontSize ? { FontSize: fontSize } : {}) });
+  };
+  const addWrapped = (value: string, alignment: JsonReceiptLine['Alignment'], style: JsonReceiptLine['CharacterStyle'] = 'Normal') => {
     let remaining = value.trim();
-    while (remaining.length > maxCharacters) {
-      let splitAt = remaining.lastIndexOf(' ', maxCharacters);
-      if (splitAt < Math.floor(maxCharacters * 0.55)) {
-        // Only split an unbroken token when it cannot fit on any printer line.
-        splitAt = maxCharacters;
-      }
-      const chunk = remaining.slice(0, splitAt).trimEnd();
-      output.push({ CharacterStyle: 'Normal', Alignment: alignment, EndOfLineFlag: true, Text: chunk });
+    if (!remaining) { addLine('', alignment, undefined, style); return; }
+    // FontSize 16 provides a little more width for naturally formatted DCC rows (e.g. the
+    // 33-character exchange-rate line) without splitting words. Longer prose wraps at words.
+    const reducedWidth = maxCharacters + Math.floor(maxCharacters / 4);
+    while (remaining.length > reducedWidth) {
+      let splitAt = remaining.lastIndexOf(' ', reducedWidth);
+      if (splitAt < Math.floor(reducedWidth * 0.55)) splitAt = reducedWidth;
+      addLine(remaining.slice(0, splitAt).trimEnd(), alignment, 16, style);
       remaining = remaining.slice(splitAt).trimStart();
     }
-    if (remaining.length) output.push({ CharacterStyle: 'Normal', Alignment: alignment, EndOfLineFlag: true, Text: remaining });
+    addLine(remaining, alignment, remaining.length > maxCharacters ? 16 : undefined, style);
+  };
+  const addColumns = (leftRaw: string, rightRaw: string) => {
+    const left = leftRaw.trim();
+    const right = rightRaw.trim();
+    if (!left || !right || left.length > maxCharacters || right.length > maxCharacters) return false;
+    const fontSize = left.length + right.length + 1 > maxCharacters ? 16 : undefined;
+    addLine(left, 'Left', fontSize, 'Normal', false);
+    addLine(right, 'Right', fontSize);
+    return true;
   };
 
-  for (const raw of text.replace(/\r\n?/g, '\n').split('\n')) {
-    const line = raw.replace(/\t/g, '    ');
+  for (const rawLine of text.replace(/\r\n?/g, '\n').split('\n')) {
+    const line = rawLine.replace(/\t/g, '    ');
     const value = line.trim();
-    if (!value) {
-      appendLine('', 'Left');
-      continue;
-    }
+    if (!value) { addLine('', 'Left'); continue; }
 
-    // Recognize receipt label/value rows, but avoid treating long natural-language prose
-    // (notably the DCC disclaimer) as two aligned columns.
+    // Explicitly format DCC key/value entries on the same line. This preserves the left
+    // receipt's exchange-rate, markup, and transaction-currency rows.
+    const colon = value.indexOf(':');
+    if (colon > 0 && colon < 30) {
+      const left = value.slice(0, colon + 1);
+      const right = value.slice(colon + 1).trim();
+      if (addColumns(left, right)) continue;
+    }
+    const currencyRow = value.match(/^(TRANSACTION CURRENCY)\s+(.+)$/i);
+    if (currencyRow && addColumns(currencyRow[1], currencyRow[2])) continue;
+
+    // Other padded columns are only treated as a table row when the label clearly looks like
+    // a receipt field; natural-language DCC disclosure remains a paragraph, not two columns.
     const columns = value.match(/^(.+?)\s{2,}(.+)$/);
     if (columns) {
       const left = columns[1].trim();
       const right = columns[2].trim();
-      if (left.length <= Math.floor(maxCharacters * 0.78) && right.length <= maxCharacters) {
-        output.push({ CharacterStyle: 'Normal', Alignment: 'Left', EndOfLineFlag: false, Text: left });
-        output.push({ CharacterStyle: 'Normal', Alignment: 'Right', EndOfLineFlag: true, Text: right });
-        continue;
-      }
+      const labelLike = left.endsWith(':') || (left.length <= maxCharacters && /^[A-Z][A-Z0-9 .%/_-]*$/.test(left));
+      if (labelLike && addColumns(left, right)) continue;
     }
 
     const leading = line.length - line.trimStart().length;
     const trailing = line.length - line.trimEnd().length;
     const centered = leading > 0 && trailing > 0 && Math.abs(leading - trailing) <= 2;
-    // Padded SimpleText alignment becomes JSON Alignment; collapse remaining repeated
-    // internal spaces so lines such as "Markup on exchange rate %:   3,25" fit cleanly.
-    const normalizedValue = value.replace(/\s{2,}/g, ' ');
-    appendLine(normalizedValue, centered ? 'Centred' : 'Left');
+    // Preserve the source's explicit DCC line breaks and wording; only wrap a line if needed.
+    addWrapped(value.replace(/\s{2,}/g, ' '), centered ? 'Centred' : 'Left');
   }
   return output;
 }
