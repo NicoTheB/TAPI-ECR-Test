@@ -18,7 +18,8 @@ type TerminalEdit = { id: string; name: string; label: string; initiatingParty: 
 type Product = { id: string; name: string; category: string; priceMinor: number; description?: string; image?: string };
 type ProductCatalog = { currency: string; minorUnitDivisor: number; products: Product[] };
 type ProductDraft = { id: string; name: string; category: string; price: string; description: string; image: string };
-type ReceiptToPrint = { receiptNumber?: string; plain?: string; printerCommands?: string; source: string };
+type JsonReceiptLine = { CharacterStyle?: 'Normal' | 'Bold'; Alignment?: 'Left' | 'Right' | 'Centred'; EndOfLineFlag?: boolean; Text?: string; FontSize?: number };
+type ReceiptToPrint = { receiptNumber?: string; plain?: string; printerCommands?: string; outputJSON?: JsonReceiptLine[]; source: string };
 type DeviceFeature = { id: string; label: string; description: string; deviceRequest: Record<string, any> };
 
 const labels: Record<OperationKind, string> = { payment: 'Payment', refund: 'Refund', reversal: 'Reversal', reconciliation: 'Capture / Reconciliation', print: 'Terminal receipt print', device: 'Device feature' };
@@ -41,8 +42,9 @@ function getReceiptContent(response: any, source: string): ReceiptToPrint | null
   const embedded = customer.embeddedPlain ?? merchant.embeddedPlain;
   const plain = customer.plain ?? merchant.plain ?? (embedded ? [embedded.header, embedded.content, embedded.footer].filter(Boolean).join('\n') : undefined);
   const printerCommands = customer.escpos ?? merchant.escpos;
-  if (!plain && !printerCommands) return null;
-  return { receiptNumber: response.receiptNumber, plain, printerCommands, source };
+  const outputJSON = customer.json ?? merchant.json;
+  if (!plain && !printerCommands && !outputJSON?.length) return null;
+  return { receiptNumber: response.receiptNumber, plain, printerCommands, outputJSON, source };
 }
 
 function printPlainReceipt(receiptText: string): boolean {
@@ -277,12 +279,12 @@ export default function App() {
   }
 
   async function printOnTerminal() {
-    if (!receiptToPrint?.printerCommands || !selectedTerminalId) return;
+    if ((!receiptToPrint?.outputJSON?.length && !receiptToPrint?.printerCommands) || !selectedTerminalId) return;
     setBusy(true); setNotice('');
     try {
       const started = await api<Op>('/api/operations/print', {
         method: 'POST',
-        body: JSON.stringify({ terminalId: selectedTerminalId, receiptData: receiptToPrint.printerCommands }),
+        body: JSON.stringify({ terminalId: selectedTerminalId, ...(receiptToPrint.outputJSON?.length ? { outputJSON: receiptToPrint.outputJSON } : { receiptData: receiptToPrint.printerCommands }) }),
       });
       setOperation(started);
       if (started.state === 'unknown') setNotice('Print request outcome is uncertain; checking terminal status.');
@@ -416,7 +418,7 @@ export default function App() {
   </section>;
 
   const latestPaymentPanel = (
-    <section className="card latest-card"><div className="latest-copy"><span className="eyebrow">PAYMENT RECEIPT</span><h3>Latest payment</h3><p>View the latest completed payment attempt, including declined or cancelled attempts. Receipt printing is available when the response includes receipt data.</p></div><button className="secondary" type="button" onClick={getLatest} disabled={busy || operationIsActive || !selectedTerminalId}>{busy ? 'Working…' : 'Get latest payment'}<span>↗</span></button>{latestError && <div className="notice latest-notice">{latestError}</div>}{latest && <div className="latest-result"><div className="meta-row"><span>Outcome</span><strong className={latest.transactionOutcome === 'Approved' ? 'approved' : ''}>{latest.transactionOutcome ?? '—'}</strong></div><div className="meta-row"><span>Showroom receipt</span><span>{latest.receiptNumber ?? (latest.transactionOutcome === 'Approved' ? '—' : 'Not assigned')}</span></div><div className="meta-row"><span>Amount</span><span>{latest.amounts?.total ?? latest.amounts?.base ?? '—'} {latest.amounts?.currency?.symbol ?? latest.amounts?.currencySymbol ?? ''}</span></div><details><summary>Full terminal response</summary><pre>{JSON.stringify(latest, null, 2)}</pre></details></div>}{receiptToPrint && <div className="receipt-actions"><div><strong>{receiptToPrint.source}</strong><span>{receiptToPrint.receiptNumber ? ` · Receipt ${receiptToPrint.receiptNumber}` : ''}</span></div><div className="receipt-buttons"><button className="secondary" type="button" onClick={() => { if (!receiptToPrint.plain) return; if (!printPlainReceipt(receiptToPrint.plain)) setNotice('Allow pop-ups for this site to print the receipt.'); }} disabled={!receiptToPrint.plain}>Print on this device</button><button className="secondary" type="button" onClick={printOnTerminal} disabled={busy || operationIsActive || !receiptToPrint.printerCommands}>{operation?.kind === 'print' && operationIsActive ? 'Printing…' : 'Print on terminal'}</button></div>{!receiptToPrint.printerCommands && <p className="field-note">This response has no receipt text for terminal printing. Plain-text printing may still be available.</p>}</div>}</section>
+    <section className="card latest-card"><div className="latest-copy"><span className="eyebrow">PAYMENT RECEIPT</span><h3>Latest payment</h3><p>View the latest completed payment attempt, including declined or cancelled attempts. Receipt printing is available when the response includes receipt data.</p></div><button className="secondary" type="button" onClick={getLatest} disabled={busy || operationIsActive || !selectedTerminalId}>{busy ? 'Working…' : 'Get latest payment'}<span>↗</span></button>{latestError && <div className="notice latest-notice">{latestError}</div>}{latest && <div className="latest-result"><div className="meta-row"><span>Outcome</span><strong className={latest.transactionOutcome === 'Approved' ? 'approved' : ''}>{latest.transactionOutcome ?? '—'}</strong></div><div className="meta-row"><span>Showroom receipt</span><span>{latest.receiptNumber ?? (latest.transactionOutcome === 'Approved' ? '—' : 'Not assigned')}</span></div><div className="meta-row"><span>Amount</span><span>{latest.amounts?.total ?? latest.amounts?.base ?? '—'} {latest.amounts?.currency?.symbol ?? latest.amounts?.currencySymbol ?? ''}</span></div><details><summary>Full terminal response</summary><pre>{JSON.stringify(latest, null, 2)}</pre></details></div>}{receiptToPrint && <div className="receipt-actions"><div><strong>{receiptToPrint.source}</strong><span>{receiptToPrint.receiptNumber ? ` · Receipt ${receiptToPrint.receiptNumber}` : ''}</span></div><div className="receipt-buttons"><button className="secondary" type="button" onClick={() => { if (!receiptToPrint.plain) return; if (!printPlainReceipt(receiptToPrint.plain)) setNotice('Allow pop-ups for this site to print the receipt.'); }} disabled={!receiptToPrint.plain}>Print on this device</button><button className="secondary" type="button" onClick={printOnTerminal} disabled={busy || operationIsActive || (!receiptToPrint.printerCommands && !receiptToPrint.outputJSON?.length)}>{operation?.kind === 'print' && operationIsActive ? 'Printing…' : 'Print on terminal'}</button></div>{!receiptToPrint.printerCommands && !receiptToPrint.outputJSON?.length && <p className="field-note">This response has no terminal-printable receipt content.</p>}</div>}</section>
   );
 
   return <main className="shell">
