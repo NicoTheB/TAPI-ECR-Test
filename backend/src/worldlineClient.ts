@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { CloudTerminal, cloudConfig, terminalConfigured } from './cloudConfig';
-import { logEvent, redactForLog } from './structuredLog';
+import { logEvent } from './structuredLog';
 
 export type WorldlineOperationKind = 'payment' | 'refund' | 'reversal' | 'reconciliation' | 'print' | 'device';
 
@@ -43,7 +43,7 @@ export async function worldlineRequest<T = any>(terminal: CloudTerminal, endpoin
   const timer = setTimeout(() => controller.abort(), cloudConfig.requestTimeoutMs);
   let response: Response;
   let text: string;
-  logEvent('worldline_api_request', { requestId, method: 'POST', endpoint, url: `${cloudConfig.baseUrl}${path}`, terminalId: terminal.id, ...(exchangeId ? { exchangeId } : {}), ...(cloudConfig.logWorldlinePayloads ? { requestPayload: redactForLog(payload) } : {}) });
+  logEvent('worldline_api_request', { requestId, method: 'POST', endpoint, terminalId: terminal.id, ...(exchangeId ? { exchangeId } : {}) });
   try {
     response = await fetch(`${cloudConfig.baseUrl}${path}`, {
       method: 'POST',
@@ -58,11 +58,7 @@ export async function worldlineRequest<T = any>(terminal: CloudTerminal, endpoin
       signal: controller.signal,
     });
     text = await response.text();
-    let responsePayload: unknown = text;
-    if (text) {
-      try { responsePayload = JSON.parse(text); } catch { /* Preserve non-JSON error text for opt-in troubleshooting. */ }
-    }
-    logEvent('worldline_api_response', { requestId, method: 'POST', endpoint, url: `${cloudConfig.baseUrl}${path}`, terminalId: terminal.id, statusCode: response.status, durationMs: Date.now() - startedAt, ...(cloudConfig.logWorldlinePayloads ? { responsePayload: redactForLog(responsePayload) } : {}) });
+    logEvent('worldline_api_response', { requestId, method: 'POST', endpoint, terminalId: terminal.id, statusCode: response.status, durationMs: Date.now() - startedAt });
   } catch (error) {
     const timedOut = error instanceof Error && error.name === 'AbortError';
     logEvent('worldline_api_transport_error', { requestId, method: 'POST', endpoint, terminalId: terminal.id, durationMs: Date.now() - startedAt, errorType: timedOut ? 'timeout' : 'network_error' });
@@ -269,7 +265,10 @@ export function makePrintRequest(terminal: CloudTerminal, operationId: string, c
   };
 }
 
-export function makeAbortRequest(terminal: CloudTerminal, operationId: string, originalExchangeId: string) {
+export function makeAbortRequest(terminal: CloudTerminal) {
+  // Diagnostic experiment: use independent UUIDs for the abort message and SystemAbort field.
+  // This intentionally differs from the original-payment reference behavior so we can compare
+  // against the Hoppscotch test. A 200 still only acknowledges delivery; inspect final outcome.
   return {
     SaleToPOIAbort: {
       Header: {
@@ -278,13 +277,12 @@ export function makeAbortRequest(terminal: CloudTerminal, operationId: string, o
         ExchangeIdentification: randomUUID(),
         CreationDateTime: new Date().toISOString(),
         InitiatingParty: { Identification: terminal.initiatingParty, Type: 'Merchant' },
-        // Keep all ECR software identity fields identical to the original payment request.
         SalesSystemInfo: saleSoftwareInfo(),
       },
       Abort: {
         Environment: environment(terminal),
         SystemAbort: {
-          ExchangeIdentification: originalExchangeId,
+          ExchangeIdentification: randomUUID(),
           AbortReason: 'Cashier requested abort',
         },
       },

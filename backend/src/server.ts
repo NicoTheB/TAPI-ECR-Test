@@ -413,12 +413,23 @@ app.post('/api/operations/:operationId/abort', async (req, res) => {
   }
   const terminal = terminals.find(item => item.id === operation.terminalId)!;
   try {
-    const payload = makeAbortRequest(terminal, operation.operationId, operation.exchangeId);
+    const payload = makeAbortRequest(terminal);
+    const abortMessage = (payload as any).SaleToPOIAbort;
+    const abortHeaderExchangeId = abortMessage.Header.ExchangeIdentification;
+    const systemAbortExchangeId = abortMessage.Abort.SystemAbort.ExchangeIdentification;
     const acknowledgement = await worldlineRequest<{ requestId?: string }>(terminal, 'payments/abort', payload);
     operation.abortRequestId = acknowledgement.data?.requestId;
     operation.state = 'abort-requested';
-    operation.message = 'Worldline accepted the abort signal. This is not yet confirmation that the terminal cancelled; waiting for the final transaction webhook.';
-    logEvent('worldline_abort_accepted', { operationId: operation.operationId, terminalId: operation.terminalId, targetExchangeId: operation.exchangeId, abortRequestId: operation.abortRequestId });
+    operation.message = 'Worldline accepted the abort signal. This diagnostic request uses fresh IDs in both abort fields; check the final payment webhook to see whether the terminal cancels.';
+    logEvent('worldline_abort_accepted', {
+      operationId: operation.operationId,
+      terminalId: operation.terminalId,
+      originalPaymentExchangeId: operation.exchangeId,
+      abortHeaderExchangeId,
+      systemAbortExchangeId,
+      idsAreDistinct: abortHeaderExchangeId !== systemAbortExchangeId && systemAbortExchangeId !== operation.exchangeId,
+      abortRequestId: operation.abortRequestId,
+    });
     res.json(publicOperation(operation));
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Abort request failed.';
