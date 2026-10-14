@@ -203,13 +203,24 @@ export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceipt
   const output: JsonReceiptLine[] = [];
   const appendLine = (value: string, alignment: JsonReceiptLine['Alignment']) => {
     if (!value) {
-      output.push({ CharacterStyle: 'Normal', Alignment: 'Left', EndOfLineFlag: true, Text: '' });
+      output.push({ CharacterStyle: 'Normal', Alignment: alignment, EndOfLineFlag: true, Text: '' });
       return;
     }
-    for (let offset = 0; offset < value.length; offset += maxCharacters) {
-      const chunk = value.slice(offset, offset + maxCharacters);
+
+    // Wrap at word boundaries instead of slicing at a fixed character offset. Fixed slicing
+    // split DCC disclaimer words (for example "pay" into "p" + "ay") on the receipt.
+    let remaining = value.trim();
+    while (remaining.length > maxCharacters) {
+      let splitAt = remaining.lastIndexOf(' ', maxCharacters);
+      if (splitAt < Math.floor(maxCharacters * 0.55)) {
+        // Only split an unbroken token when it cannot fit on any printer line.
+        splitAt = maxCharacters;
+      }
+      const chunk = remaining.slice(0, splitAt).trimEnd();
       output.push({ CharacterStyle: 'Normal', Alignment: alignment, EndOfLineFlag: true, Text: chunk });
+      remaining = remaining.slice(splitAt).trimStart();
     }
+    if (remaining.length) output.push({ CharacterStyle: 'Normal', Alignment: alignment, EndOfLineFlag: true, Text: remaining });
   };
 
   for (const raw of text.replace(/\r\n?/g, '\n').split('\n')) {
@@ -220,25 +231,26 @@ export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceipt
       continue;
     }
 
+    // Recognize receipt label/value rows, but avoid treating long natural-language prose
+    // (notably the DCC disclaimer) as two aligned columns.
     const columns = value.match(/^(.+?)\s{2,}(.+)$/);
     if (columns) {
       const left = columns[1].trim();
       const right = columns[2].trim();
-      // On the Worldline JSON format, EndOfLineFlag=false continues on the same line.
-      if (left.length <= maxCharacters && right.length <= maxCharacters) {
+      if (left.length <= Math.floor(maxCharacters * 0.78) && right.length <= maxCharacters) {
         output.push({ CharacterStyle: 'Normal', Alignment: 'Left', EndOfLineFlag: false, Text: left });
         output.push({ CharacterStyle: 'Normal', Alignment: 'Right', EndOfLineFlag: true, Text: right });
-      } else {
-        appendLine(left, 'Left');
-        appendLine(right, 'Right');
+        continue;
       }
-      continue;
     }
 
     const leading = line.length - line.trimStart().length;
     const trailing = line.length - line.trimEnd().length;
     const centered = leading > 0 && trailing > 0 && Math.abs(leading - trailing) <= 2;
-    appendLine(value, centered ? 'Centred' : 'Left');
+    // Padded SimpleText alignment becomes JSON Alignment; collapse remaining repeated
+    // internal spaces so lines such as "Markup on exchange rate %:   3,25" fit cleanly.
+    const normalizedValue = value.replace(/\s{2,}/g, ' ');
+    appendLine(normalizedValue, centered ? 'Centred' : 'Left');
   }
   return output;
 }
