@@ -467,10 +467,12 @@ export default function App() {
           </div>)}</div>}
           <div className="cart-total"><span>Total</span><strong>{formatPrice(cartTotalMinor)}</strong></div>
           <button className="primary checkout-button" type="button" disabled={busy || operationIsActive || !selectedTerminalId || !catalog || cartTotalMinor <= 0} onClick={checkout}>{busy ? 'Please wait…' : 'Pay at selected terminal'}<span>→</span></button>
-          {latestPaymentPanel}
           <p className="security-note"><span>◆</span> Product lines stay in this register; the terminal receives the total amount only.</p>
-          {operationStatus}
         </section>
+        <div className="operation-receipt-column">
+          {operationStatus}
+          {latestPaymentPanel}
+        </div>
       </div>
     </> : view === 'manual' ? <>
       <div className="layout">
