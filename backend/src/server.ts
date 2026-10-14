@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { cloudConfig, safeTerminals, terminals, terminalConfigured, CloudTerminal } from './cloudConfig';
 import { makeAbortRequest, makeDeviceFeatureRequest, makeFinancialRequest, makePrintRequest, makeReconciliationRequest, worldlineRequest, WorldlineHttpError, WorldlineOperationKind } from './worldlineClient';
 import { deviceFeatureTemplates } from './deviceFeatures';
-import { getLogRecords, logEvent } from './structuredLog';
+import { getLogRecords, logEvent, redactForLog } from './structuredLog';
 
 const app = express();
 app.use(express.json({ limit: '512kb' }));
@@ -162,6 +162,7 @@ app.get('/api/config', (_req, res) => res.json({
   settingsEnabled: Boolean(cloudConfig.adminPin),
   terminals: safeTerminals(),
   pollIntervalMs: 1200,
+  worldlinePayloadLogging: cloudConfig.logWorldlinePayloads,
   webhookMode: (() => { try { return new URL(cloudConfig.webhookBaseUrl).hostname; } catch { return 'invalid'; } })(),
 }));
 app.get('/api/device/features', (_req, res) => res.json({ features: deviceFeatureTemplates }));
@@ -233,7 +234,7 @@ function loadTerminalSettings() {
   for (const record of records) {
     const terminal = terminals.find(item => item.id === record.id)!;
     terminal.name = record.name; terminal.label = record.label;
-    terminal.initiatingParty = record.initiatingParty; terminal.poiId = record.poiId;
+    terminal.initiatingParty = record.initiatingParty; terminal.poiId = record.poiId.trim() || terminal.poiId;
     if (record.umid !== undefined) terminal.umid = record.umid;
     if (record.utid !== undefined) terminal.utid = record.utid;
     if (record.jwt !== undefined) terminal.jwt = record.jwt;
@@ -258,13 +259,13 @@ app.put('/api/admin/terminals', requireAdmin, (req, res) => {
     }
     const records: PersistedTerminalSettings[] = input.map(({ clearJwt, jwt, ...record }) => {
       const current = terminals.find(terminal => terminal.id === record.id)!;
-      return { ...record, jwt: clearJwt ? '' : (jwt?.trim() || current.jwt) };
+      return { ...record, poiId: record.poiId.trim() || current.poiId, jwt: clearJwt ? '' : (jwt?.trim() || current.jwt) };
     });
     saveTerminalSettings(records);
     for (const record of records) {
       const terminal = terminals.find(item => item.id === record.id)!;
       terminal.name = record.name; terminal.label = record.label;
-      terminal.initiatingParty = record.initiatingParty; terminal.poiId = record.poiId;
+      terminal.initiatingParty = record.initiatingParty; terminal.poiId = record.poiId.trim() || terminal.poiId;
       terminal.umid = record.umid ?? ''; terminal.utid = record.utid ?? ''; terminal.jwt = record.jwt ?? '';
     }
     logEvent('terminal_settings_updated', { terminalIds: records.map(record => record.id), configuredCount: records.filter(record => Boolean(record.umid && record.utid && record.jwt)).length });
@@ -449,6 +450,16 @@ app.post('/api/worldline/webhook', (req, res) => {
     return;
   }
   if (operation.state === 'completed') { res.status(200).json({ ok: true, duplicate: true }); return; }
+  // Async Worldline endpoints return an acknowledgement; the final terminal response arrives here.
+  // Full callback logging is opt-in because response payloads may include receipt/payment data.
+  if (cloudConfig.logWorldlinePayloads) {
+    logEvent('worldline_webhook_payload', {
+      operationId,
+      terminalId: operation.terminalId,
+      kind: operation.kind,
+      responsePayload: redactForLog(req.body),
+    });
+  }
   completeOperation(operation, req.body);
   logEvent('worldline_webhook_completed', { operationId, terminalId: operation.terminalId, kind: operation.kind, state: operation.state, outcome: operation.result?.transactionOutcome, detail: operation.result?.outcomeDescription });
   res.status(200).json({ ok: true });

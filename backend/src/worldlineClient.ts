@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { CloudTerminal, cloudConfig, terminalConfigured } from './cloudConfig';
-import { logEvent } from './structuredLog';
+import { logEvent, redactForLog } from './structuredLog';
 
 export type WorldlineOperationKind = 'payment' | 'refund' | 'reversal' | 'reconciliation' | 'print' | 'device';
 
@@ -43,7 +43,7 @@ export async function worldlineRequest<T = any>(terminal: CloudTerminal, endpoin
   const timer = setTimeout(() => controller.abort(), cloudConfig.requestTimeoutMs);
   let response: Response;
   let text: string;
-  logEvent('worldline_api_request', { requestId, method: 'POST', endpoint, terminalId: terminal.id, ...(exchangeId ? { exchangeId } : {}) });
+  logEvent('worldline_api_request', { requestId, method: 'POST', endpoint, url: `${cloudConfig.baseUrl}${path}`, terminalId: terminal.id, ...(exchangeId ? { exchangeId } : {}), ...(cloudConfig.logWorldlinePayloads ? { requestPayload: redactForLog(payload) } : {}) });
   try {
     response = await fetch(`${cloudConfig.baseUrl}${path}`, {
       method: 'POST',
@@ -58,7 +58,11 @@ export async function worldlineRequest<T = any>(terminal: CloudTerminal, endpoin
       signal: controller.signal,
     });
     text = await response.text();
-    logEvent('worldline_api_response', { requestId, method: 'POST', endpoint, terminalId: terminal.id, statusCode: response.status, durationMs: Date.now() - startedAt });
+    let responsePayload: unknown = text;
+    if (text) {
+      try { responsePayload = JSON.parse(text); } catch { /* Keep non-JSON response text for opt-in troubleshooting. */ }
+    }
+    logEvent('worldline_api_response', { requestId, method: 'POST', endpoint, url: `${cloudConfig.baseUrl}${path}`, terminalId: terminal.id, statusCode: response.status, durationMs: Date.now() - startedAt, ...(cloudConfig.logWorldlinePayloads ? { responsePayload: redactForLog(responsePayload) } : {}) });
   } catch (error) {
     const timedOut = error instanceof Error && error.name === 'AbortError';
     logEvent('worldline_api_transport_error', { requestId, method: 'POST', endpoint, terminalId: terminal.id, durationMs: Date.now() - startedAt, errorType: timedOut ? 'timeout' : 'network_error' });
