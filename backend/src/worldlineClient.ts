@@ -196,6 +196,13 @@ export function makeReconciliationRequest(terminal: CloudTerminal, operationId: 
   };
 }
 
+type JsonReceiptLine = {
+  CharacterStyle: 'Normal';
+  Alignment: 'Left' | 'Right' | 'Centred';
+  EndOfLineFlag: boolean;
+  Text: string;
+};
+
 // Convert Worldline's SimpleText receipt into the documented JSON printer extension.
 // Remove original padding, keep centered headings, and render double-spaced label/value
 // rows as a left-aligned label plus a right-aligned value on the same printer line.

@@ -5,7 +5,6 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { z } from 'zod';
 import { cloudConfig, safeTerminals, terminals, terminalConfigured, CloudTerminal } from './cloudConfig';
 import { makeAbortRequest, makeDeviceFeatureRequest, makeFinancialRequest, makePrintRequest, makeReconciliationRequest, worldlineRequest, WorldlineHttpError, WorldlineOperationKind } from './worldlineClient';
-import type { JsonReceiptLine } from './worldlineClient';
 import { deviceFeatureTemplates } from './deviceFeatures';
 import { getLogRecords, logEvent, redactForLog } from './structuredLog';
 
@@ -368,7 +367,7 @@ async function startOperation(kind: WorldlineOperationKind, req: Request, res: R
       payload = makeDeviceFeatureRequest(terminal, operationId, callbackToken, deviceInput.deviceRequest);
     } else {
       const printInput = input as z.infer<typeof printSchema>;
-      payload = makePrintRequest(terminal, operationId, callbackToken, printInput.receiptData, printInput.outputJSON as JsonReceiptLine[] | undefined);
+      payload = makePrintRequest(terminal, operationId, callbackToken, printInput.receiptData, printInput.outputJSON);
     }
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : 'Could not prepare Worldline request.' });
