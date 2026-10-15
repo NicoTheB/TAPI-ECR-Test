@@ -196,13 +196,25 @@ export function makeReconciliationRequest(terminal: CloudTerminal, operationId: 
   };
 }
 
+// Wording that marks the start of a Dynamic Currency Conversion (DCC) section on a receipt.
+// Matching is case-insensitive. If a terminal words its DCC text differently, add it here.
+const DCC_WORDING = /\bDCC\b|DYNAMIC CURRENCY|CONVERSION|CONVERTED|EXCHANGE RATE|RATE OF EXCHANGE|MARK[- ]?UP|MARGIN|\bECB\b|EUROPEAN CENTRAL BANK|TRANSACTION CURRENCY|OFFERED (?:A|THE) CHOICE|CHOICE OF (?:PAYMENT )?CURRENC/i;
+
+// Closing line of a receipt, e.g. "SAVE RECEIPT, CUSTOMER'S COPY" / "MERCHANT COPY".
+const RECEIPT_FOOTER = /SAVE RECEIPT|(?:CUSTOMER|MERCHANT|CARDHOLDER|CASHIER)(?:'S)? COPY/i;
+
 // Convert Worldline's SimpleText receipt into the documented JSON printer extension.
 // Remove original padding, keep centered headings, and render double-spaced label/value
 // rows as a left-aligned label plus a right-aligned value on the same printer line.
+// DCC text (the disclosure paragraph) is always centred; see DCC_WORDING.
 export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceiptLine[] {
   const output: JsonReceiptLine[] = [];
+  // True while printing the DCC section; every non-empty line in it uses FontSize 16.
+  let inDcc = false;
+  const DCC_FONT_SIZE = 16;
   const addLine = (text: string, alignment: JsonReceiptLine['Alignment'], fontSize?: number, style: JsonReceiptLine['CharacterStyle'] = 'Normal', eol = true) => {
-    output.push({ CharacterStyle: style, Alignment: alignment, EndOfLineFlag: eol, Text: text, ...(fontSize ? { FontSize: fontSize } : {}) });
+    const size = fontSize ?? (inDcc && text ? DCC_FONT_SIZE : undefined);
+    output.push({ CharacterStyle: style, Alignment: alignment, EndOfLineFlag: eol, Text: text, ...(size ? { FontSize: size } : {}) });
   };
   const addWrapped = (value: string, alignment: JsonReceiptLine['Alignment'], style: JsonReceiptLine['CharacterStyle'] = 'Normal') => {
     let remaining = value.trim();
@@ -220,18 +232,63 @@ export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceipt
   };
   const addColumns = (leftRaw: string, rightRaw: string) => {
     const left = leftRaw.trim();
-    const right = rightRaw.trim();
+    let right = rightRaw.trim();
     if (!left || !right || left.length > maxCharacters || right.length > maxCharacters) return false;
+    // Collapse padding inside the value (e.g. "2025-07-24     TIME:11:40") when that lets the
+    // row fit on one printer line without a reduced font size.
+    if (left.length + right.length + 1 > maxCharacters) {
+      const compact = right.replace(/\s{2,}/g, ' ');
+      if (left.length + compact.length + 1 <= maxCharacters) right = compact;
+    }
     const fontSize = left.length + right.length + 1 > maxCharacters ? 16 : undefined;
     addLine(left, 'Left', fontSize, 'Normal', false);
     addLine(right, 'Right', fontSize);
     return true;
   };
 
-  for (const rawLine of text.replace(/\r\n?/g, '\n').split('\n')) {
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  // The DCC section starts at the first line with DCC wording and ends at the first blank line
+  // after its disclosure text. Text lines inside it are centred; label/value rows (exchange
+  // rate, markup, currency) keep their columns, and amount-only lines are left as they were.
+  const dccStart = lines.findIndex(line => DCC_WORDING.test(line.replace(/\s+/g, ' ')));
+  let dccHasText = false;
+  // Header block = the first group of lines before the first blank line (merchant name, address,
+  // phone, org number). Lines there that the terminal centred itself stay centred, even when
+  // they look like label/value rows (e.g. "Tel.: 0840015400").
+  const firstText = lines.findIndex(entry => entry.trim());
+  const firstBlank = firstText < 0 ? -1 : lines.findIndex((entry, i) => i > firstText && !entry.trim());
+  const headerEnd = firstBlank < 0 ? 0 : firstBlank;
+
+  for (const [index, rawLine] of lines.entries()) {
     const line = rawLine.replace(/\t/g, '    ');
     const value = line.trim();
-    if (!value) { addLine('', 'Left'); continue; }
+    if (index === dccStart) inDcc = true;
+    if (!value) {
+      if (inDcc && dccHasText) inDcc = false;
+      addLine('', 'Left');
+      continue;
+    }
+
+    if (index < headerEnd) {
+      const headLead = line.length - line.trimStart().length;
+      const headTrail = line.length - line.trimEnd().length;
+      if (headLead > 0 && headTrail > 0 && Math.abs(headLead - headTrail) <= 2) {
+        addWrapped(value.replace(/\s{2,}/g, ' '), 'Centred');
+        continue;
+      }
+    }
+
+    if (!inDcc) {
+      // "DATE:2025-07-24      TIME:11:40" / "RECEIPT:000004    REF:308356275839": each value
+      // stays attached to its own label; the first pair is left, the second pair is right.
+      const pairs = value.match(/^(\S+:\S+)\s{2,}(\S+:\S+)$/);
+      if (pairs && addColumns(pairs[1], pairs[2])) continue;
+      // "ATC:000E", "AID:A0000000031010", ...: label and value are one token, so keep them
+      // together as plain left-aligned text.
+      if (/^\S+:\S+$/.test(value)) { addWrapped(value, 'Left'); continue; }
+    }
+    // Closing lines such as "SAVE RECEIPT, CUSTOMER'S COPY" are centred.
+    if (RECEIPT_FOOTER.test(value)) { addWrapped(value.replace(/\s{2,}/g, ' '), 'Centred'); continue; }
 
     // Explicitly format DCC key/value entries on the same line. This preserves the left
     // receipt's exchange-rate, markup, and transaction-currency rows.
@@ -258,7 +315,13 @@ export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceipt
     const trailing = line.length - line.trimEnd().length;
     const centered = leading > 0 && trailing > 0 && Math.abs(leading - trailing) <= 2;
     // Preserve the source's explicit DCC line breaks and wording; only wrap a line if needed.
-    addWrapped(value.replace(/\s{2,}/g, ' '), centered ? 'Centred' : 'Left');
+    // An amount on its own line inside the DCC section (e.g. the converted total under
+    // TRANSACTION CURRENCY) is right-aligned.
+    const amountOnly = inDcc && /^[\d\s.,+-]+$/.test(value);
+    if (amountOnly) { addLine(value, 'Right'); continue; }
+    const centreAsDcc = inDcc;
+    if (centreAsDcc) dccHasText = true;
+    addWrapped(value.replace(/\s{2,}/g, ' '), centered || centreAsDcc ? 'Centred' : 'Left');
   }
   return output;
 }
