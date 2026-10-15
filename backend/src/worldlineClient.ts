@@ -212,6 +212,15 @@ export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceipt
   // True while printing the DCC section; every non-empty line in it uses FontSize 16.
   let inDcc = false;
   const DCC_FONT_SIZE = 16;
+  // On the terminal, a label/value pair at FontSize 16 only gets about half a line for the
+  // label: "Markup on exchange rate %:" and "TRANSACTION CURRENCY" wrapped even though the
+  // whole row was short enough ("Exchange rate:", 14 characters, is known to fit).
+  // Rows with a longer label are therefore sent as ONE entry, padded with spaces so the value
+  // ends at the right edge. DCC_LINE_WIDTH is the number of characters per FontSize-16 line;
+  // it is estimated from that wrapping (about 19 characters per half line). If the value wraps
+  // to a new line on paper, lower it by 1; if it stops short of the right edge, raise it by 1.
+  const DCC_MAX_ROW_LABEL = 14;
+  const DCC_LINE_WIDTH = 38;
   const addLine = (text: string, alignment: JsonReceiptLine['Alignment'], fontSize?: number, style: JsonReceiptLine['CharacterStyle'] = 'Normal', eol = true) => {
     const size = fontSize ?? (inDcc && text ? DCC_FONT_SIZE : undefined);
     output.push({ CharacterStyle: style, Alignment: alignment, EndOfLineFlag: eol, Text: text, ...(size ? { FontSize: size } : {}) });
@@ -234,6 +243,12 @@ export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceipt
     const left = leftRaw.trim();
     let right = rightRaw.trim();
     if (!left || !right || left.length > maxCharacters || right.length > maxCharacters) return false;
+    if (inDcc && left.length > DCC_MAX_ROW_LABEL) {
+      const gap = DCC_LINE_WIDTH - left.length - right.length;
+      if (gap >= 1) addLine(`${left}${' '.repeat(gap)}${right}`, 'Left');
+      else { addLine(left, 'Left'); addLine(right, 'Right'); } // too long even for one line
+      return true;
+    }
     // Collapse padding inside the value (e.g. "2025-07-24     TIME:11:40") when that lets the
     // row fit on one printer line without a reduced font size.
     if (left.length + right.length + 1 > maxCharacters) {

@@ -330,7 +330,7 @@ async function startOperation(kind: WorldlineOperationKind, req: Request, res: R
     const receipt = (input as z.infer<typeof reversalSchema>).receiptNumber;
     originalTransaction = (transactions.get(terminal.id) ?? []).find(item => item.receiptNumber === receipt || item.originalTransaction?.TransactionReference === receipt);
     if (!originalTransaction?.originalTransaction) {
-      res.status(404).json({ error: 'No saved payment reference matches that receipt number. Reversal requires an original payment recorded by this showroom backend.' });
+      res.status(404).json({ error: 'No saved payment matches that transaction reference. Reversal requires an original payment recorded by this showroom backend.' });
       return;
     }
   }
