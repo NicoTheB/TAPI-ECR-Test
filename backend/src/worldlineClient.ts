@@ -201,7 +201,10 @@ export function makeReconciliationRequest(terminal: CloudTerminal, operationId: 
 const DCC_WORDING = /\bDCC\b|DYNAMIC CURRENCY|CONVERSION|CONVERTED|EXCHANGE RATE|RATE OF EXCHANGE|MARK[- ]?UP|MARGIN|\bECB\b|EUROPEAN CENTRAL BANK|TRANSACTION CURRENCY|OFFERED (?:A|THE) CHOICE|CHOICE OF (?:PAYMENT )?CURRENC/i;
 
 // Closing line of a receipt, e.g. "SAVE RECEIPT, CUSTOMER'S COPY" / "MERCHANT COPY".
-const RECEIPT_FOOTER = /SAVE RECEIPT|(?:CUSTOMER|MERCHANT|CARDHOLDER|CASHIER)(?:'S)? COPY/i;
+const RECEIPT_FOOTER = /SAVE RECEIPT|(?:CUSTOMER|MERCHANT|CARDHOLDER|CASHIER)(?:'S)? COPY|^[\s*=-]*END[\s*=-]*$/i;
+
+// A row that ends with an amount, e.g. "TOTAL  DKK 7560.00" or "Visa 3   7,560.00".
+const AMOUNT_ROW = /^(.*?\S)\s+((?:[A-Z]{3}\s+)?-?\d[\d.,]*[.,]\d{2,3})$/;
 
 // Convert Worldline's SimpleText receipt into the documented JSON printer extension.
 // Remove original padding, keep centered headings, and render double-spaced label/value
@@ -216,11 +219,12 @@ export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceipt
   // label: "Markup on exchange rate %:" and "TRANSACTION CURRENCY" wrapped even though the
   // whole row was short enough ("Exchange rate:", 14 characters, is known to fit).
   // Rows with a longer label are therefore sent as ONE entry, padded with spaces so the value
-  // ends at the right edge. DCC_LINE_WIDTH is the number of characters per FontSize-16 line;
+  // ends at the right edge. The same is done for any other row that ends with an amount and is too
+  // wide for one normal-size line. FS16_LINE_WIDTH is the number of characters per FontSize-16 line;
   // it is estimated from that wrapping (about 19 characters per half line). If the value wraps
   // to a new line on paper, lower it by 1; if it stops short of the right edge, raise it by 1.
   const DCC_MAX_ROW_LABEL = 14;
-  const DCC_LINE_WIDTH = 38;
+  const FS16_LINE_WIDTH = 38;
   const addLine = (text: string, alignment: JsonReceiptLine['Alignment'], fontSize?: number, style: JsonReceiptLine['CharacterStyle'] = 'Normal', eol = true) => {
     const size = fontSize ?? (inDcc && text ? DCC_FONT_SIZE : undefined);
     output.push({ CharacterStyle: style, Alignment: alignment, EndOfLineFlag: eol, Text: text, ...(size ? { FontSize: size } : {}) });
@@ -244,7 +248,7 @@ export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceipt
     let right = rightRaw.trim();
     if (!left || !right || left.length > maxCharacters || right.length > maxCharacters) return false;
     if (inDcc && left.length > DCC_MAX_ROW_LABEL) {
-      const gap = DCC_LINE_WIDTH - left.length - right.length;
+      const gap = FS16_LINE_WIDTH - left.length - right.length;
       if (gap >= 1) addLine(`${left}${' '.repeat(gap)}${right}`, 'Left');
       else { addLine(left, 'Left'); addLine(right, 'Right'); } // too long even for one line
       return true;
@@ -273,6 +277,12 @@ export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceipt
   const firstText = lines.findIndex(entry => entry.trim());
   const firstBlank = firstText < 0 ? -1 : lines.findIndex((entry, i) => i > firstText && !entry.trim());
   const headerEnd = firstBlank < 0 ? 0 : firstBlank;
+  const evenlyPadded = (entry: string) => {
+    const padded = entry.replace(/\t/g, '    ');
+    const lead = padded.length - padded.trimStart().length;
+    const trail = padded.length - padded.trimEnd().length;
+    return padded.trim() !== '' && lead > 0 && trail > 0 && Math.abs(lead - trail) <= 2;
+  };
 
   for (const [index, rawLine] of lines.entries()) {
     const line = rawLine.replace(/\t/g, '    ');
@@ -285,15 +295,38 @@ export function receiptTextToJson(text: string, maxCharacters = 32): JsonReceipt
     }
 
     if (index < headerEnd) {
-      const headLead = line.length - line.trimStart().length;
-      const headTrail = line.length - line.trimEnd().length;
-      if (headLead > 0 && headTrail > 0 && Math.abs(headLead - headTrail) <= 2) {
+      if (evenlyPadded(line)) {
+        addWrapped(value.replace(/\s{2,}/g, ' '), 'Centred');
+        continue;
+      }
+      // The first header line (the merchant name) loses its leading padding if the receipt text
+      // was trimmed on the way here. It is still centred when the next header line is.
+      if (index === firstText && headerEnd - firstText > 1 && !/\S:\s*\S/.test(value) && evenlyPadded(lines[firstText + 1])) {
         addWrapped(value.replace(/\s{2,}/g, ' '), 'Centred');
         continue;
       }
     }
 
     if (!inDcc) {
+      // Rows that end with an amount ("TOTAL  DKK 7560.00"): the label is on the left and the whole
+      // amount is right-aligned on the same printer line, never split across two lines.
+      const amountRow = value.match(AMOUNT_ROW);
+      if (amountRow) {
+        const label = amountRow[1].replace(/\s{2,}/g, ' ');
+        const amount = amountRow[2].replace(/\s{2,}/g, ' ');
+        if (/[A-Za-z]/.test(label) && !/^[A-Z]{3}$/.test(label) && amount.length <= maxCharacters) {
+          if (label.length + amount.length + 1 <= maxCharacters) {
+            addLine(label, 'Left', undefined, 'Normal', false);
+            addLine(amount, 'Right');
+          } else if (label.length + amount.length + 1 <= FS16_LINE_WIDTH) {
+            addLine(`${label}${' '.repeat(FS16_LINE_WIDTH - label.length - amount.length)}${amount}`, 'Left', 16);
+          } else {
+            addWrapped(label, 'Left');
+            addLine(amount, 'Right');
+          }
+          continue;
+        }
+      }
       // "DATE:2025-07-24      TIME:11:40" / "RECEIPT:000004    REF:308356275839": each value
       // stays attached to its own label; the first pair is left, the second pair is right.
       const pairs = value.match(/^(\S+:\S+)\s{2,}(\S+:\S+)$/);

@@ -7,6 +7,8 @@ import { cloudConfig, safeTerminals, terminals, terminalConfigured, CloudTermina
 import { makeAbortRequest, makeDeviceFeatureRequest, makeFinancialRequest, makePrintRequest, makeReconciliationRequest, receiptTextToJson, worldlineRequest, WorldlineHttpError, WorldlineOperationKind } from './worldlineClient';
 import type { JsonReceiptLine } from './worldlineClient';
 import { deviceFeatureTemplates } from './deviceFeatures';
+import { buildStatusSlip, learnReceiptIdentity } from './receiptHeader';
+import type { ReceiptIdentity } from './receiptHeader';
 import { getLogRecords, logEvent, redactForLog } from './structuredLog';
 
 const app = express();
@@ -48,7 +50,7 @@ const reconciliationSchema = z.object({
   }
 });
 const jsonReceiptLineSchema = z.object({ CharacterStyle: z.enum(['Normal', 'Bold']).optional(), Alignment: z.enum(['Left', 'Right', 'Centred']).optional(), EndOfLineFlag: z.boolean().optional(), Text: z.string().max(2000).optional(), FontSize: z.number().int().min(1).max(128).optional() });
-const printSchema = z.object({ terminalId: z.string().min(1), receiptData: z.string().trim().min(1).max(20000).optional(), outputJSON: z.array(jsonReceiptLineSchema).min(1).max(500).optional() }).refine(value => Boolean(value.receiptData || value.outputJSON?.length), 'Provide receipt text or JSON receipt lines.');
+const printSchema = z.object({ terminalId: z.string().min(1), receiptData: z.string().min(1).max(20000).optional(), outputJSON: z.array(jsonReceiptLineSchema).min(1).max(500).optional() }).refine(value => Boolean(value.receiptData?.trim() || value.outputJSON?.length), 'Provide receipt text or JSON receipt lines.');
 const deviceFeatureSchema = z.object({
   terminalId: z.string().min(1),
   featureId: z.string().min(1).max(80),
@@ -83,6 +85,7 @@ type Operation = {
   captureEmail?: string;
   requestedAmountMinor?: number;
   requestedCurrency?: string;
+  reversalOf?: { TransactionDateTime: string; TransactionReference: string };
 };
 type SavedTransaction = {
   terminalId: string;
@@ -95,6 +98,8 @@ const operations = new Map<string, Operation>();
 const activeByTerminal = new Map<string, string>();
 const transactions = new Map<string, SavedTransaction[]>();
 const latestPayment = new Map<string, Record<string, any>>();
+// TERMINAL: / MERCHANT: values copied from the last real receipt of each terminal, for the status slips.
+const terminalIdentity = new Map<string, ReceiptIdentity>();
 const receiptCounters = new Map<string, number>();
 const failedAdminAttempts = new Map<string, { count: number; until: number }>();
 
@@ -352,6 +357,7 @@ async function startOperation(kind: WorldlineOperationKind, req: Request, res: R
       requestedAmountMinor: (input as z.infer<typeof moneySchema>).amount,
       requestedCurrency: (input as z.infer<typeof moneySchema>).currencySymbol,
     } : {}),
+    ...(kind === 'reversal' && originalTransaction?.originalTransaction ? { reversalOf: originalTransaction.originalTransaction } : {}),
   };
   let payload: unknown;
   try {
@@ -477,6 +483,12 @@ app.post('/api/worldline/webhook', (req, res) => {
 function completeOperation(operation: Operation, envelope: any) {
   const raw = envelope?.data ?? envelope ?? null;
   const result = normalizeResult(operation.kind, raw);
+  // Remember the TERMINAL: / MERCHANT: values printed on the terminal's own receipts.
+  const receiptSample = result.receipt?.customer?.plain ?? result.receipt?.merchant?.plain;
+  if (typeof receiptSample === 'string') {
+    const learned = learnReceiptIdentity(receiptSample);
+    if (learned.terminalId || learned.merchantId) terminalIdentity.set(operation.terminalId, { ...terminalIdentity.get(operation.terminalId), ...learned });
+  }
   if (operation.kind === 'payment' && !result.receipt && ['Declined', 'Cancelled'].includes(result.transactionOutcome)) {
     const status = result.transactionOutcome === 'Cancelled' ? 'CANCELLED' : 'DECLINED';
     const amountMajor = operation.requestedAmountMinor !== undefined ? operation.requestedAmountMinor / 100 : undefined;
@@ -484,7 +496,7 @@ function completeOperation(operation: Operation, envelope: any) {
       ? `Amount: ${operation.requestedCurrency ?? ''} ${amountMajor.toFixed(2)}`.trim()
       : '';
     const reason = result.outcomeDescription ? `Reason: ${String(result.outcomeDescription)}` : '';
-    const slip = [
+    const slipBody = [
       'PAYMENT NOT COMPLETED',
       status,
       'NO PAYMENT TAKEN',
@@ -493,12 +505,18 @@ function completeOperation(operation: Operation, envelope: any) {
       'SHOWROOM STATUS SLIP',
       'Not an official terminal receipt',
     ].filter(Boolean).join('\n');
+    // Same header section as the terminal's own receipts, followed by the slip content.
+    const slip = buildStatusSlip(terminalIdentity.get(operation.terminalId), new Date(), receiptTextToJson(slipBody));
     result.receiptStatusSlip = true;
     result.receipt = {
-      customer: { plain: slip, escpos: slip },
-      merchant: { plain: slip, escpos: slip },
+      customer: { plain: slip.plain, escpos: slip.plain, json: slip.json },
+      merchant: { plain: slip.plain, escpos: slip.plain, json: slip.json },
     };
   }
+  if (operation.kind === 'payment' || operation.kind === 'reversal') result.operationKind = operation.kind;
+  // The terminal's reversal response carries no transaction reference of its own; show the reference
+  // of the payment that was reversed.
+  if (operation.kind === 'reversal' && !result.originalTransaction && operation.reversalOf) result.originalTransaction = operation.reversalOf;
   if (operation.kind === 'payment' && !result.amounts && operation.requestedAmountMinor !== undefined) {
     result.amounts = {
       base: operation.requestedAmountMinor,
@@ -513,9 +531,9 @@ function completeOperation(operation: Operation, envelope: any) {
   operation.requestId = envelope?.requestId ?? operation.requestId;
   if (activeByTerminal.get(operation.terminalId) === operation.operationId) activeByTerminal.delete(operation.terminalId);
 
-  // Latest payment means the latest completed payment attempt, regardless of its outcome.
+  // Latest payment means the latest completed payment or reversal attempt, regardless of its outcome.
   // Reversal/receipt history below remains limited to approved payments with a usable transaction reference.
-  if (operation.kind === 'payment') latestPayment.set(operation.terminalId, result);
+  if (operation.kind === 'payment' || operation.kind === 'reversal') latestPayment.set(operation.terminalId, result);
 
   if (operation.kind === 'payment' && result.transactionOutcome === 'Approved') {
     const original = result.originalTransaction;
@@ -752,7 +770,7 @@ app.get('/api/payments/latest', (req, res) => {
   if (!terminal) { res.status(400).json({ error: 'Select a configured terminal.' }); return; }
   if (activeByTerminal.has(terminal.id)) { res.status(409).json({ error: 'Payment lookup is unavailable while this terminal has an active operation.' }); return; }
   const latest = latestPayment.get(terminal.id);
-  if (!latest) { res.status(404).json({ error: 'No completed payment attempt is available in this backend session.' }); return; }
+  if (!latest) { res.status(404).json({ error: 'No completed payment or reversal attempt is available in this backend session.' }); return; }
   res.json(latest);
 });
 app.get('/api/payments/:receiptNumber', (req, res) => {
