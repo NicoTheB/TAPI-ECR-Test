@@ -22,6 +22,8 @@ type JsonReceiptLine = { CharacterStyle?: 'Normal' | 'Bold'; Alignment?: 'Left' 
 type ReceiptToPrint = { receiptNumber?: string; plain?: string; printerCommands?: string; outputJSON?: JsonReceiptLine[]; source: string };
 type DeviceFeature = { id: string; label: string; description: string; deviceRequest: Record<string, any> };
 
+type NewTerminal = { name: string; label: string; umid: string; utid: string; jwt: string; initiatingParty: string; poiId: string };
+const emptyNewTerminal: NewTerminal = { name: '', label: '', umid: '', utid: '', jwt: '', initiatingParty: '', poiId: '' };
 const labels: Record<OperationKind, string> = { payment: 'Payment', refund: 'Refund', reversal: 'Reversal', reconciliation: 'Capture / Reconciliation', print: 'Terminal receipt print', device: 'Device feature' };
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
@@ -163,6 +165,9 @@ export default function App() {
   const [settings, setSettings] = useState<TerminalEdit[]>([]);
   const [settingsMessage, setSettingsMessage] = useState('');
   const [settingsBusy, setSettingsBusy] = useState(false);
+  const [removeConfirmId, setRemoveConfirmId] = useState('');
+  const [addTerminalOpen, setAddTerminalOpen] = useState(false);
+  const [newTerminal, setNewTerminal] = useState<NewTerminal>(emptyNewTerminal);
   const [productAdminPin, setProductAdminPin] = useState('');
   const [productsUnlocked, setProductsUnlocked] = useState(false);
   const [productCatalogDraft, setProductCatalogDraft] = useState<ProductCatalog | null>(null);
@@ -332,7 +337,7 @@ export default function App() {
     try {
       const found = await api<Record<string, any>>(`/api/payments/latest?terminalId=${encodeURIComponent(selectedTerminalId)}`);
       setLatest(found);
-      setReceiptToPrint(getReceiptContent(found, 'Latest payment'));
+      setReceiptToPrint(getReceiptContent(found, found.operationKind === 'reversal' ? 'Latest reversal' : found.operationKind === 'reconciliation' ? 'Latest capture' : 'Latest payment'));
     } catch (e) { setLatestError(e instanceof Error ? e.message : 'Could not retrieve latest payment'); }
     finally { setBusy(false); }
   }
@@ -406,6 +411,51 @@ export default function App() {
     setSettings(current => current.map((terminal, i) => i === index ? { ...terminal, [field]: value } : terminal));
   }
 
+  async function removeTerminal(id: string) {
+    setSettingsBusy(true); setSettingsMessage('');
+    try {
+      await api<{ terminals: TerminalEdit[]; removed: string }>(`/api/admin/terminals/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        headers: { 'X-Admin-Pin': adminPin },
+      });
+      // Keep any unsaved edits to the other terminals; just drop the removed one.
+      setSettings(current => current.filter(terminal => terminal.id !== id));
+      setRemoveConfirmId('');
+      const updatedConfig = await api<TerminalConfig>('/api/config');
+      setConfig(updatedConfig);
+      if (selectedTerminalId === id) {
+        setSelectedTerminalId(updatedConfig.terminals[0]?.id ?? '');
+        setLatest(null); setLatestError(''); setReceiptToPrint(null);
+      }
+      setSettingsMessage(`Terminal ${id} removed.`);
+    } catch (e) { setRemoveConfirmId(''); setSettingsMessage(e instanceof Error ? e.message : 'Could not remove the terminal'); }
+    finally { setSettingsBusy(false); }
+  }
+
+  function updateNewTerminal(field: keyof NewTerminal, value: string) {
+    setNewTerminal(current => ({ ...current, [field]: value }));
+  }
+
+  async function addTerminal() {
+    if (!newTerminal.name.trim() || !newTerminal.label.trim()) { setSettingsMessage('Enter a display name and a selector label for the new terminal.'); return; }
+    setSettingsBusy(true); setSettingsMessage('');
+    try {
+      const saved = await api<{ terminals: TerminalEdit[]; added: string }>('/api/admin/terminals', {
+        method: 'POST',
+        headers: { 'X-Admin-Pin': adminPin },
+        body: JSON.stringify({ ...newTerminal, jwt: newTerminal.jwt.trim() || undefined }),
+      });
+      const created = saved.terminals.find(terminal => terminal.id === saved.added);
+      // Keep any unsaved edits to the other terminals; just append the new one.
+      if (created) setSettings(current => [...current, { ...created, jwtInput: '', clearJwt: false }]);
+      setNewTerminal(emptyNewTerminal);
+      setAddTerminalOpen(false);
+      setConfig(await api<TerminalConfig>('/api/config'));
+      setSettingsMessage(`Terminal added as ${saved.added} and saved on the backend. It now appears in the terminal selector.`);
+    } catch (e) { setSettingsMessage(e instanceof Error ? e.message : 'Could not add the terminal'); }
+    finally { setSettingsBusy(false); }
+  }
+
   async function unlockProducts(event: FormEvent) {
     event.preventDefault();
     setProductSettingsBusy(true);
@@ -477,7 +527,7 @@ export default function App() {
   </section>;
 
   const latestPaymentPanel = (
-    <section className="card latest-card"><div className="latest-copy"><span className="eyebrow">PAYMENT RECEIPT</span><h3>Latest payment</h3><p>View the latest completed payment or reversal attempt, including declined or cancelled attempts. Receipt printing is available when the response includes receipt data.</p></div><button className="secondary" type="button" onClick={getLatest} disabled={busy || operationIsActive || !selectedTerminalId}>{busy ? 'Working…' : 'Get latest payment'}<span>↗</span></button>{latestError && <div className="notice latest-notice">{latestError}</div>}{latest && <div className="latest-result"><div className="meta-row"><span>Type</span><span>{latest.operationKind === 'reversal' ? 'Reversal' : 'Payment'}</span></div><div className="meta-row"><span>Outcome</span><strong className={latest.transactionOutcome === 'Approved' ? 'approved' : ''}>{latest.transactionOutcome ?? '—'}</strong></div><div className="meta-row"><span>Transaction Reference</span><span>{latest.originalTransaction?.TransactionReference ?? '—'}</span></div><div className="meta-row"><span>Amount</span><span>{latest.amounts?.total ?? latest.amounts?.base ?? '—'} {latest.amounts?.currency?.symbol ?? latest.amounts?.currencySymbol ?? ''}</span></div><details><summary>Full terminal response</summary><pre>{JSON.stringify(latest, null, 2)}</pre></details></div>}{receiptToPrint && <div className="receipt-actions"><div><strong>{receiptToPrint.source}</strong><span>{receiptToPrint.receiptNumber ? ` · Receipt ${receiptToPrint.receiptNumber}` : ''}</span></div><div className="receipt-buttons"><button className="secondary" type="button" onClick={() => { if (!receiptToPrint.plain) return; if (!printPlainReceipt(receiptToPrint.plain)) setNotice('Allow pop-ups for this site to print the receipt.'); }} disabled={!receiptToPrint.plain}>Print on this device</button><button className="secondary" type="button" onClick={printOnTerminal} disabled={busy || operationIsActive || (!receiptToPrint.printerCommands && !receiptToPrint.outputJSON?.length)}>{operation?.kind === 'print' && operationIsActive ? 'Printing…' : 'Print on terminal'}</button></div>{!receiptToPrint.printerCommands && !receiptToPrint.outputJSON?.length && <p className="field-note">This response has no terminal-printable receipt content.</p>}</div>}</section>
+    <section className="card latest-card"><div className="latest-copy"><span className="eyebrow">PAYMENT RECEIPT</span><h3>Latest payment</h3><p>View the latest completed payment, reversal or capture, including declined or cancelled attempts. Receipt printing is available when the response includes receipt data.</p></div><button className="secondary" type="button" onClick={getLatest} disabled={busy || operationIsActive || !selectedTerminalId}>{busy ? 'Working…' : 'Get latest payment'}<span>↗</span></button>{latestError && <div className="notice latest-notice">{latestError}</div>}{latest && <div className="latest-result"><div className="meta-row"><span>Type</span><span>{latest.operationKind === 'reversal' ? 'Reversal' : latest.operationKind === 'reconciliation' ? 'Capture' : 'Payment'}</span></div><div className="meta-row"><span>Outcome</span><strong className={latest.transactionOutcome === 'Approved' ? 'approved' : ''}>{latest.transactionOutcome ?? '—'}</strong></div>{latest.operationKind !== 'reconciliation' && <><div className="meta-row"><span>Transaction Reference</span><span>{latest.originalTransaction?.TransactionReference ?? '—'}</span></div><div className="meta-row"><span>Amount</span><span>{latest.amounts?.total ?? latest.amounts?.base ?? '—'} {latest.amounts?.currency?.symbol ?? latest.amounts?.currencySymbol ?? ''}</span></div></>}<details><summary>Full terminal response</summary><pre>{JSON.stringify(latest, null, 2)}</pre></details></div>}{receiptToPrint && <div className="receipt-actions"><div><strong>{receiptToPrint.source}</strong><span>{receiptToPrint.receiptNumber ? ` · Receipt ${receiptToPrint.receiptNumber}` : ''}</span></div><div className="receipt-buttons"><button className="secondary" type="button" onClick={() => { if (!receiptToPrint.plain) return; if (!printPlainReceipt(receiptToPrint.plain)) setNotice('Allow pop-ups for this site to print the receipt.'); }} disabled={!receiptToPrint.plain}>Print on this device</button><button className="secondary" type="button" onClick={printOnTerminal} disabled={busy || operationIsActive || (!receiptToPrint.printerCommands && !receiptToPrint.outputJSON?.length)}>{operation?.kind === 'print' && operationIsActive ? 'Printing…' : 'Print on terminal'}</button></div>{!receiptToPrint.printerCommands && !receiptToPrint.outputJSON?.length && <p className="field-note">This response has no terminal-printable receipt content.</p>}</div>}</section>
   );
 
   return <main className="shell">
@@ -585,6 +635,7 @@ export default function App() {
         <button className="primary settings-submit" type="submit" disabled={!config?.settingsEnabled || settingsBusy || !adminPin}>{settingsBusy ? 'Checking…' : 'Unlock terminal settings'}<span>→</span></button>
       </form> : <form onSubmit={saveSettings}>
         <p className="field-note settings-note">Edit terminal name, selector label, Nexo InitiatingParty, and optional POI identification. UMID, UTID, and JWT are deliberately managed in the backend/Render environment and are never sent to this browser.</p>
+        <p className="field-note settings-note"><strong>Storage:</strong> terminal settings, including terminals you add or remove here, are saved to a file on the backend. On Render free that file is lost whenever the service restarts or redeploys; the terminals then go back to the ones in the Render environment settings.</p>
         {settings.map((terminal, index) => <div className="terminal-settings-card" key={terminal.id}>
           <div className="card-title"><div><span className="eyebrow">{terminal.id}</span><h3>{terminal.label || terminal.name}</h3></div><span className="step">{terminal.configured ? 'READY' : 'CREDENTIALS PENDING'}</span></div>
           <div className="catalog-settings-meta terminal-settings-fields">
@@ -600,7 +651,29 @@ export default function App() {
             <span className="field-note">{terminal.jwtConfigured ? 'JWT configured. Existing key is hidden.' : 'No JWT configured yet.'} UMID / UTID {terminal.umid && terminal.utid ? 'configured.' : 'required for API requests.'}</span>
             {terminal.jwtConfigured && <label className="clear-jwt-control"><input type="checkbox" checked={terminal.clearJwt} onChange={event => setSettings(current => current.map((item, i) => i === index ? { ...item, clearJwt: event.target.checked, jwtInput: '' } : item))} disabled={settingsBusy} /> Clear saved JWT</label>}
           </div>
+          <div className="credential-actions">
+            {removeConfirmId === terminal.id
+              ? <><span className="field-note">Remove {terminal.label || terminal.name}? Its settings and credentials are deleted from the backend.</span>
+                <button className="secondary" type="button" onClick={() => removeTerminal(terminal.id)} disabled={settingsBusy}>Yes, remove</button>
+                <button className="secondary" type="button" onClick={() => setRemoveConfirmId('')} disabled={settingsBusy}>Cancel</button></>
+              : <button className="secondary" type="button" onClick={() => setRemoveConfirmId(terminal.id)} disabled={settingsBusy || settings.length <= 1}>Remove terminal</button>}
+            {settings.length <= 1 && <span className="field-note">At least one terminal must remain.</span>}
+          </div>
         </div>)}
+        {addTerminalOpen ? <div className="terminal-settings-card">
+          <div className="card-title"><div><span className="eyebrow">NEW TERMINAL</span><h3>Add terminal</h3></div><span className="step">NEW</span></div>
+          <div className="catalog-settings-meta terminal-settings-fields">
+            <label>Display name<input value={newTerminal.name} maxLength={80} onChange={e => updateNewTerminal('name', e.target.value)} disabled={settingsBusy} /></label>
+            <label>Selector label<input value={newTerminal.label} maxLength={80} onChange={e => updateNewTerminal('label', e.target.value)} disabled={settingsBusy} /></label>
+            <label>UMID<input value={newTerminal.umid} maxLength={128} onChange={e => updateNewTerminal('umid', e.target.value)} disabled={settingsBusy} autoComplete="off" /></label>
+            <label>UTID<input value={newTerminal.utid} maxLength={128} onChange={e => updateNewTerminal('utid', e.target.value)} disabled={settingsBusy} autoComplete="off" /></label>
+            <label>API Key (JWT) <span className="hint">write-only</span><input type="password" value={newTerminal.jwt} maxLength={16384} onChange={e => updateNewTerminal('jwt', e.target.value)} disabled={settingsBusy} autoComplete="new-password" placeholder="Paste bearer JWT" /></label>
+            <label>Nexo InitiatingParty ID<input value={newTerminal.initiatingParty} maxLength={35} onChange={e => updateNewTerminal('initiatingParty', e.target.value)} disabled={settingsBusy} placeholder="Blank = Showroom-<terminal ID>" /></label>
+            <label>POI identification <span className="hint">optional</span><input value={newTerminal.poiId} maxLength={80} onChange={e => updateNewTerminal('poiId', e.target.value)} disabled={settingsBusy} placeholder="Leave blank unless Worldline supplies one" /></label>
+          </div>
+          <div className="credential-actions"><span className="field-note">The terminal gets the next free ID (terminal4, terminal5, ...) and is saved on the backend as soon as you add it. Other unsaved edits on this page are kept.</span></div>
+          <div className="settings-actions"><button className="secondary" type="button" onClick={() => { setAddTerminalOpen(false); setNewTerminal(emptyNewTerminal); }} disabled={settingsBusy}>Cancel</button><button className="primary settings-save" type="button" onClick={addTerminal} disabled={settingsBusy}>{settingsBusy ? 'Adding…' : 'Add terminal'}<span>→</span></button></div>
+        </div> : <div className="settings-actions"><button className="secondary" type="button" onClick={() => setAddTerminalOpen(true)} disabled={settingsBusy}>Add terminal</button></div>}
         <div className="settings-actions"><button className="secondary" type="button" onClick={exportLogs} disabled={settingsBusy}>{settingsBusy ? 'Working…' : 'Download JSON logs'}</button><button className="primary settings-save" type="submit" disabled={settingsBusy}>{settingsBusy ? 'Saving…' : 'Save terminal settings'}<span>→</span></button></div>
         <button className="text-button lock-settings" type="button" onClick={() => { setSettingsUnlocked(false); setSettings([]); setAdminPin(''); }}>Lock terminal settings</button>
       </form>}
