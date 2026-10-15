@@ -9,6 +9,8 @@ import type { JsonReceiptLine } from './worldlineClient';
 import { deviceFeatureTemplates } from './deviceFeatures';
 import { buildStatusSlip, learnReceiptIdentity } from './receiptHeader';
 import type { ReceiptIdentity } from './receiptHeader';
+import { applySavedTerminals, applyTerminalDocument, MAX_TERMINALS, nextTerminalId, removedAfterRemoving, removeTerminalById } from './terminalSettings';
+import type { TerminalDocument } from './terminalSettings';
 import { getLogRecords, logEvent, redactForLog } from './structuredLog';
 
 const app = express();
@@ -202,7 +204,7 @@ app.put('/api/admin/products', requireAdmin, (req, res) => {
 // Full terminal settings are editable behind ADMIN_PIN. JWTs are stored server-side only;
 // the settings GET response exposes a configured flag, never the bearer token itself.
 // Full cloud terminal settings are editable behind ADMIN_PIN. JWTs are write-only over the API.
-const terminalDisplaySchema = z.array(z.object({
+const terminalRecordSchema = z.object({
   id: z.string().min(1).max(32),
   name: z.string().trim().min(1).max(80),
   label: z.string().trim().min(1).max(80),
@@ -211,7 +213,11 @@ const terminalDisplaySchema = z.array(z.object({
   umid: z.string().trim().max(128).optional(),
   utid: z.string().trim().max(128).optional(),
   jwt: z.string().trim().max(16384).optional(),
-})).min(1).max(50);
+});
+const terminalFileSchema = z.object({
+  terminals: z.array(terminalRecordSchema).max(50),
+  removed: z.array(z.string().min(1).max(32)).max(200).default([]),
+});
 const terminalSettingsInputSchema = z.array(z.object({
   id: z.string().min(1).max(32),
   name: z.string().trim().min(1).max(80),
@@ -223,7 +229,7 @@ const terminalSettingsInputSchema = z.array(z.object({
   jwt: z.string().trim().max(16384).optional(),
   clearJwt: z.boolean().optional(),
 })).min(1).max(50);
-type PersistedTerminalSettings = z.infer<typeof terminalDisplaySchema>[number];
+type PersistedTerminalSettings = z.infer<typeof terminalRecordSchema>;
 
 function publicTerminalSettings() {
   return terminals.map(terminal => ({
@@ -233,28 +239,37 @@ function publicTerminalSettings() {
     jwtConfigured: Boolean(terminal.jwt), configured: terminalConfigured(terminal),
   }));
 }
-function loadTerminalSettings() {
+
+// IDs of terminals removed in the settings screen (see terminalSettings.ts).
+let removedTerminalIds: string[] = [];
+function readTerminalFile(): TerminalDocument | undefined {
   const file = path.resolve(process.cwd(), cloudConfig.terminalSettingsFile);
-  if (!existsSync(file)) return;
-  const records = terminalDisplaySchema.parse(JSON.parse(readFileSync(file, 'utf8')));
-  if (records.length !== terminals.length || records.some(record => !terminals.some(terminal => terminal.id === record.id))) {
-    throw new Error('Saved cloud terminal settings must contain exactly the terminal IDs configured in TERMINALS.');
-  }
-  for (const record of records) {
-    const terminal = terminals.find(item => item.id === record.id)!;
-    terminal.name = record.name; terminal.label = record.label;
-    terminal.initiatingParty = record.initiatingParty; terminal.poiId = record.poiId.trim() || terminal.poiId;
-    if (record.umid !== undefined) terminal.umid = record.umid;
-    if (record.utid !== undefined) terminal.utid = record.utid;
-    if (record.jwt !== undefined) terminal.jwt = record.jwt;
-  }
+  if (!existsSync(file)) return undefined;
+  const raw = JSON.parse(readFileSync(file, 'utf8'));
+  // Older versions saved a plain array of terminal records.
+  if (Array.isArray(raw)) return { terminals: z.array(terminalRecordSchema).max(50).parse(raw), removed: [] };
+  return terminalFileSchema.parse(raw);
 }
-function saveTerminalSettings(records: PersistedTerminalSettings[]) {
+function loadTerminalSettings() {
+  const doc = readTerminalFile();
+  if (!doc) return;
+  removedTerminalIds = doc.removed;
+  applyTerminalDocument(terminals, doc);
+}
+function saveTerminalSettings(records: PersistedTerminalSettings[], removed: string[] = removedTerminalIds) {
   const output = path.resolve(process.cwd(), cloudConfig.terminalSettingsFile);
   mkdirSync(path.dirname(output), { recursive: true });
   const temp = `${output}.${process.pid}.tmp`;
-  writeFileSync(temp, `${JSON.stringify(records, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  writeFileSync(temp, `${JSON.stringify({ terminals: records, removed }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   renameSync(temp, output);
+  removedTerminalIds = removed;
+}
+// Everything the backend remembers about a terminal that was removed.
+function forgetTerminal(id: string) {
+  transactions.delete(id);
+  latestPayment.delete(id);
+  receiptCounters.delete(id);
+  terminalIdentity.delete(id);
 }
 loadTerminalSettings();
 app.get('/api/admin/terminals', requireAdmin, (_req, res) => res.json({ terminals: publicTerminalSettings() }));
@@ -285,6 +300,63 @@ app.put('/api/admin/terminals', requireAdmin, (req, res) => {
     }
     logEvent('terminal_settings_save_failed', { error: error instanceof Error ? error.message : 'unknown error' });
     res.status(400).json({ error: error instanceof Error ? error.message : 'Could not save terminal settings.' });
+  }
+});
+
+const terminalAddSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  label: z.string().trim().min(1).max(80),
+  initiatingParty: z.string().trim().max(35).optional(),
+  poiId: z.string().trim().max(80).optional(),
+  umid: z.string().trim().max(128).optional(),
+  utid: z.string().trim().max(128).optional(),
+  jwt: z.string().trim().max(16384).optional(),
+});
+app.post('/api/admin/terminals', requireAdmin, (req, res) => {
+  try {
+    if (terminals.length >= MAX_TERMINALS) { res.status(400).json({ error: `At most ${MAX_TERMINALS} terminals are supported.` }); return; }
+    const input = terminalAddSchema.parse(req.body);
+    const id = nextTerminalId(terminals, removedTerminalIds);
+    const record: PersistedTerminalSettings = {
+      id,
+      name: input.name,
+      label: input.label,
+      initiatingParty: input.initiatingParty || `Showroom-${id}`,
+      poiId: input.poiId ?? '',
+      umid: input.umid ?? '',
+      utid: input.utid ?? '',
+      jwt: input.jwt ?? '',
+    };
+    // Save first, then add to the live list, so a failed write leaves nothing half-added.
+    const saved = readTerminalFile()?.terminals ?? [];
+    saveTerminalSettings([...saved.filter(item => item.id !== id), record]);
+    applySavedTerminals(terminals, [record]);
+    logEvent('terminal_added', { terminalId: id, configured: Boolean(record.umid && record.utid && record.jwt) });
+    res.status(201).json({ terminals: publicTerminalSettings(), added: id });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ error: 'Invalid terminal settings.', details: error.issues.map(issue => ({ field: issue.path.join('.'), message: issue.message })) }); return;
+    }
+    logEvent('terminal_add_failed', { error: error instanceof Error ? error.message : 'unknown error' });
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Could not add the terminal.' });
+  }
+});
+app.delete('/api/admin/terminals/:id', requireAdmin, (req, res) => {
+  const id = String(req.params.id ?? '');
+  if (!terminals.some(terminal => terminal.id === id)) { res.status(404).json({ error: 'No terminal with that ID.' }); return; }
+  if (terminals.length <= 1) { res.status(400).json({ error: 'At least one terminal must remain.' }); return; }
+  if (activeByTerminal.has(id)) { res.status(409).json({ error: 'This terminal has an active operation. Finish or abort it before removing the terminal.' }); return; }
+  try {
+    // Save first, then remove from the live list, so a failed write leaves the terminal in place.
+    const saved = readTerminalFile()?.terminals ?? [];
+    saveTerminalSettings(saved.filter(record => record.id !== id), removedAfterRemoving(removedTerminalIds, id));
+    removeTerminalById(terminals, id);
+    forgetTerminal(id);
+    logEvent('terminal_removed', { terminalId: id });
+    res.json({ terminals: publicTerminalSettings(), removed: id });
+  } catch (error) {
+    logEvent('terminal_remove_failed', { error: error instanceof Error ? error.message : 'unknown error' });
+    res.status(400).json({ error: error instanceof Error ? error.message : 'Could not remove the terminal.' });
   }
 });
 
@@ -513,7 +585,7 @@ function completeOperation(operation: Operation, envelope: any) {
       merchant: { plain: slip.plain, escpos: slip.plain, json: slip.json },
     };
   }
-  if (operation.kind === 'payment' || operation.kind === 'reversal') result.operationKind = operation.kind;
+  if (operation.kind === 'payment' || operation.kind === 'reversal' || operation.kind === 'reconciliation') result.operationKind = operation.kind;
   // The terminal's reversal response carries no transaction reference of its own; show the reference
   // of the payment that was reversed.
   if (operation.kind === 'reversal' && !result.originalTransaction && operation.reversalOf) result.originalTransaction = operation.reversalOf;
@@ -531,9 +603,9 @@ function completeOperation(operation: Operation, envelope: any) {
   operation.requestId = envelope?.requestId ?? operation.requestId;
   if (activeByTerminal.get(operation.terminalId) === operation.operationId) activeByTerminal.delete(operation.terminalId);
 
-  // Latest payment means the latest completed payment or reversal attempt, regardless of its outcome.
+  // Latest means the latest completed payment, reversal or capture attempt, regardless of its outcome.
   // Reversal/receipt history below remains limited to approved payments with a usable transaction reference.
-  if (operation.kind === 'payment' || operation.kind === 'reversal') latestPayment.set(operation.terminalId, result);
+  if (operation.kind === 'payment' || operation.kind === 'reversal' || operation.kind === 'reconciliation') latestPayment.set(operation.terminalId, result);
 
   if (operation.kind === 'payment' && result.transactionOutcome === 'Approved') {
     const original = result.originalTransaction;
@@ -770,7 +842,7 @@ app.get('/api/payments/latest', (req, res) => {
   if (!terminal) { res.status(400).json({ error: 'Select a configured terminal.' }); return; }
   if (activeByTerminal.has(terminal.id)) { res.status(409).json({ error: 'Payment lookup is unavailable while this terminal has an active operation.' }); return; }
   const latest = latestPayment.get(terminal.id);
-  if (!latest) { res.status(404).json({ error: 'No completed payment or reversal attempt is available in this backend session.' }); return; }
+  if (!latest) { res.status(404).json({ error: 'No completed payment, reversal or capture is available in this backend session.' }); return; }
   res.json(latest);
 });
 app.get('/api/payments/:receiptNumber', (req, res) => {
