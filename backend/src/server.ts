@@ -765,6 +765,24 @@ function renderReceiptSections(sections: ReceiptSections): string {
   return [sections.header, sections.content, sections.footer].filter(section => section.length > 0).join('\n');
 }
 
+// Finds receipt documents (objects with a DocumentQualifier and OutputContent) anywhere in a terminal
+// response. Payments and captures put them at known places; for reversals the location is not
+// documented in this project, so they are searched for.
+function findReceiptDocuments(node: any, depth = 0, found: any[] = []): any[] {
+  if (!node || typeof node !== 'object' || depth > 10) return found;
+  if (Array.isArray(node)) { for (const item of node) findReceiptDocuments(item, depth + 1, found); return found; }
+  if (typeof node.DocumentQualifier === 'string' && node.OutputContent && typeof node.OutputContent === 'object') { found.push(node); return found; }
+  for (const value of Object.values(node)) findReceiptDocuments(value, depth + 1, found);
+  return found;
+}
+// Receipt text delivered as standard Nexo OutputText entries instead of MessageContent / OutputJSON.
+function receiptOutputText(output: any): string | undefined {
+  const items = Array.isArray(output?.OutputText) ? output.OutputText : undefined;
+  if (!items?.length) return undefined;
+  const text = items.map((item: any) => String(item?.Text ?? '')).join('\n');
+  return text.trim() ? text : undefined;
+}
+
 function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string, any> {
   const isRejection = Boolean(raw?.SaleToPOIMessageRejection);
   const service = raw?.SaleToPOIServiceResponse?.ServiceResponse ?? {};
@@ -788,7 +806,9 @@ function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string,
   const transactionOutcome = approved ? 'Approved' : declined ? (['aborted', 'cancel'].includes(String(responseReason).toLowerCase()) ? 'Cancelled' : 'Declined') : 'Unknown';
   const reversal = service?.FinancialReversalResponse ?? {};
   const sourceReceipt = payment?.PaymentReceipt ?? paymentTransaction?.PaymentReceipt ?? reversal?.Receipt ?? reconciliation?.PaymentReceipt ?? [];
-  const receiptList = Array.isArray(sourceReceipt) ? sourceReceipt : [sourceReceipt];
+  const knownReceipts = (Array.isArray(sourceReceipt) ? sourceReceipt : [sourceReceipt]).filter((item: any) => item?.DocumentQualifier);
+  // Not at one of the known places (e.g. a reversal): look for the receipt documents anywhere in the response.
+  const receiptList = knownReceipts.length ? knownReceipts : findReceiptDocuments(raw);
   const customerReceipt = receiptList.find((item: any) => item?.DocumentQualifier === 'CustomerReceipt');
   const merchantReceipt = receiptList.find((item: any) => item?.DocumentQualifier === 'CashierReceipt');
   const customerOutput = customerReceipt?.OutputContent ?? {};
@@ -799,8 +819,8 @@ function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string,
   const merchantWrappedSections = extractReceiptTargetSections(merchantOutput, 'merchant');
   const customerJson = customerWrappedSections ? receiptSectionsToJson(customerWrappedSections) : customerOriginalJson;
   const merchantJson = merchantWrappedSections ? receiptSectionsToJson(merchantWrappedSections) : merchantOriginalJson;
-  const customerText = customerWrappedSections ? renderReceiptSections(customerWrappedSections) : customerOutput?.MessageContent ?? (customerJson ? renderJsonReceipt(customerJson) : undefined);
-  const merchantText = merchantWrappedSections ? renderReceiptSections(merchantWrappedSections) : merchantOutput?.MessageContent ?? (merchantJson ? renderJsonReceipt(merchantJson) : undefined);
+  const customerText = customerWrappedSections ? renderReceiptSections(customerWrappedSections) : customerOutput?.MessageContent ?? (customerJson ? renderJsonReceipt(customerJson) : undefined) ?? receiptOutputText(customerOutput);
+  const merchantText = merchantWrappedSections ? renderReceiptSections(merchantWrappedSections) : merchantOutput?.MessageContent ?? (merchantJson ? renderJsonReceipt(merchantJson) : undefined) ?? receiptOutputText(merchantOutput);
   const originalId = payment?.POITransactionIdentification ?? paymentTransaction?.POITransactionIdentification;
   const totalAmount = retailerResult?.RequestedTransaction?.TransactionDetails?.TotalAmount
     ?? paymentTransaction?.TransactionDetails?.TotalAmount
