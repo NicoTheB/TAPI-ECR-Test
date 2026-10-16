@@ -19,7 +19,7 @@ React showroom register with a Node/TypeScript backend for the Worldline Termina
 - Opt-in capture-result email with a formatted JSON attachment via Resend
 - Existing product catalog/editor, guarded by `ADMIN_PIN`
 
-**Not included yet:** other administrative controls, pre-authorisations, durable transaction storage, and JWT acquisition/refresh. Device examples are templates; terminal model, firmware, and configuration determine which features are supported. The JWT values are treated as supplied bearer tokens and are not refreshed by the app.
+**Not included yet:** other administrative controls, pre-authorisations, durable transaction storage other than the optional Upstash Redis storage described under **Persistent storage on Render free**, and JWT acquisition/refresh. Device examples are templates; terminal model, firmware, and configuration determine which features are supported. The JWT values are treated as supplied bearer tokens and are not refreshed by the app.
 
 ## Authentication / identifiers
 
@@ -44,6 +44,32 @@ The existing receipt-reprint action remains a separate `print` operation; it con
 ## Configure terminal names in the frontend
 
 Select **Terminal settings**, enter `ADMIN_PIN`, then edit each terminal's display name, selector label, UMID, UTID, API Key (JWT), Nexo `InitiatingParty` identifier, and optional POI identifier. The backend persists settings in `data/cloud-terminals.json` with owner-only permissions (0600 where supported). The JWT field is write-only: the backend never returns a token to the browser. Leave it blank to retain the current JWT, or use **Clear saved JWT** to remove it. The file is ignored by Git. On Render free, the filesystem is ephemeral, so UI-configured settings may be lost on restart/redeploy; use Render environment variables or persistent storage for reliable operation. Environment settings bootstrap values when no UI-saved settings exist.
+
+## Persistent storage on Render free (Upstash Redis)
+
+Render's free tier has no persistent disk and restarts the service when idle or redeployed. Without storage, terminals you add, remove or edit, product catalog changes and the payment history are lost at every restart. The backend can keep them in a free Upstash Redis database instead. It needs no extra npm package, and nothing changes if you do not configure it.
+
+What is stored:
+
+- **Terminal settings** (including terminals added or removed in the UI, and JWTs) - encrypted.
+- **Payment history per terminal** - encrypted: approved payments with their Transaction Reference and receipt text, the latest payment / reversal / capture, the local receipt counter and the terminal's TERMINAL:/MERCHANT: values. After a restart you can still use **Get latest**, reprint, look up a receipt and reverse an earlier payment. The 100 most recent payments per terminal are kept. Raw terminal responses are not stored.
+- **Product catalog** - not encrypted (nothing secret).
+- Not stored: operations that are in progress when the service restarts.
+
+Setup:
+
+1. Create a free Redis database at <https://upstash.com> and copy its **REST URL** and **REST token** (the read/write token, from the REST API section).
+2. Create a long random passphrase of at least 16 characters, for example `openssl rand -base64 32`. Keep it safe: without it the saved terminals and history cannot be read.
+3. In Render, add these environment variables to the service (never commit them): `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, `SETTINGS_ENCRYPTION_KEY`.
+4. Redeploy. **Terminal settings** then shows "Saved to Upstash Redis".
+
+Notes:
+
+- With storage configured, the terminals in your `TERMINALS` environment setting are the starting point; changes you save are remembered on top of them. A saved value wins over the environment, so after rotating a JWT in Render, update it in **Terminal settings** too.
+- Removing a terminal that comes from `TERMINALS` is remembered, and a removed terminal ID is not reused. Removing a terminal also deletes its stored history.
+- If Upstash cannot be reached or the passphrase is wrong, the backend still starts, using the environment terminals and empty history. **Terminal settings** shows a warning, and changes are refused so saved data is never overwritten. Nothing is written to the history until it could be read.
+- If `SETTINGS_ENCRYPTION_KEY` is missing or shorter than 16 characters, terminal settings and history are not sent to Upstash at all; only the product catalog is.
+- Check Upstash's current free-plan limits and inactivity rules before relying on it.
 
 ## Async webhook behavior and webhook.site testing
 
