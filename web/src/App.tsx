@@ -22,6 +22,7 @@ type JsonReceiptLine = { CharacterStyle?: 'Normal' | 'Bold'; Alignment?: 'Left' 
 type ReceiptToPrint = { receiptNumber?: string; plain?: string; printerCommands?: string; outputJSON?: JsonReceiptLine[]; source: string };
 type DeviceFeature = { id: string; label: string; description: string; deviceRequest: Record<string, any> };
 
+type StorageInfo = { remote: boolean; encrypted: boolean; terminals: 'remote' | 'local'; products: 'remote' | 'local'; history: 'remote' | 'memory'; message: string; warning?: string };
 type NewTerminal = { name: string; label: string; umid: string; utid: string; jwt: string; initiatingParty: string; poiId: string };
 const emptyNewTerminal: NewTerminal = { name: '', label: '', umid: '', utid: '', jwt: '', initiatingParty: '', poiId: '' };
 const labels: Record<OperationKind, string> = { payment: 'Payment', refund: 'Refund', reversal: 'Reversal', reconciliation: 'Capture / Reconciliation', print: 'Terminal receipt print', device: 'Device feature' };
@@ -165,6 +166,7 @@ export default function App() {
   const [settings, setSettings] = useState<TerminalEdit[]>([]);
   const [settingsMessage, setSettingsMessage] = useState('');
   const [settingsBusy, setSettingsBusy] = useState(false);
+  const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
   const [removeConfirmId, setRemoveConfirmId] = useState('');
   const [addTerminalOpen, setAddTerminalOpen] = useState(false);
   const [newTerminal, setNewTerminal] = useState<NewTerminal>(emptyNewTerminal);
@@ -360,7 +362,8 @@ export default function App() {
     event.preventDefault();
     setSettingsBusy(true); setSettingsMessage('');
     try {
-      const data = await api<{ terminals: TerminalEdit[] }>('/api/admin/terminals', { headers: { 'X-Admin-Pin': adminPin } });
+      const data = await api<{ terminals: TerminalEdit[]; storage?: StorageInfo }>('/api/admin/terminals', { headers: { 'X-Admin-Pin': adminPin } });
+      setStorageInfo(data.storage ?? null);
       setSettings(data.terminals.map(terminal => ({ ...terminal, jwtInput: '', clearJwt: false })));
       setSettingsUnlocked(true);
       setSettingsMessage('Terminal settings unlocked.');
@@ -372,7 +375,7 @@ export default function App() {
     event.preventDefault();
     setSettingsBusy(true); setSettingsMessage('');
     try {
-      const saved = await api<{ terminals: TerminalEdit[] }>('/api/admin/terminals', {
+      const saved = await api<{ terminals: TerminalEdit[]; storage?: StorageInfo }>('/api/admin/terminals', {
         method: 'PUT',
         headers: { 'X-Admin-Pin': adminPin },
         body: JSON.stringify({ terminals: settings.map(({ configured: _configured, jwtConfigured: _jwtConfigured, jwtInput, ...terminal }) => ({
@@ -381,6 +384,7 @@ export default function App() {
         })) }),
       });
       setSettings(saved.terminals.map(terminal => ({ ...terminal, jwtInput: '', clearJwt: false })));
+      if (saved.storage) setStorageInfo(saved.storage);
       const updatedConfig = await api<TerminalConfig>('/api/config');
       setConfig(updatedConfig);
       setSettingsMessage('Terminal connection settings saved securely on the backend.');
@@ -414,10 +418,11 @@ export default function App() {
   async function removeTerminal(id: string) {
     setSettingsBusy(true); setSettingsMessage('');
     try {
-      await api<{ terminals: TerminalEdit[]; removed: string }>(`/api/admin/terminals/${encodeURIComponent(id)}`, {
+      const result = await api<{ terminals: TerminalEdit[]; removed: string; storage?: StorageInfo }>(`/api/admin/terminals/${encodeURIComponent(id)}`, {
         method: 'DELETE',
         headers: { 'X-Admin-Pin': adminPin },
       });
+      if (result.storage) setStorageInfo(result.storage);
       // Keep any unsaved edits to the other terminals; just drop the removed one.
       setSettings(current => current.filter(terminal => terminal.id !== id));
       setRemoveConfirmId('');
@@ -440,7 +445,7 @@ export default function App() {
     if (!newTerminal.name.trim() || !newTerminal.label.trim()) { setSettingsMessage('Enter a display name and a selector label for the new terminal.'); return; }
     setSettingsBusy(true); setSettingsMessage('');
     try {
-      const saved = await api<{ terminals: TerminalEdit[]; added: string }>('/api/admin/terminals', {
+      const saved = await api<{ terminals: TerminalEdit[]; added: string; storage?: StorageInfo }>('/api/admin/terminals', {
         method: 'POST',
         headers: { 'X-Admin-Pin': adminPin },
         body: JSON.stringify({ ...newTerminal, jwt: newTerminal.jwt.trim() || undefined }),
@@ -448,6 +453,7 @@ export default function App() {
       const created = saved.terminals.find(terminal => terminal.id === saved.added);
       // Keep any unsaved edits to the other terminals; just append the new one.
       if (created) setSettings(current => [...current, { ...created, jwtInput: '', clearJwt: false }]);
+      if (saved.storage) setStorageInfo(saved.storage);
       setNewTerminal(emptyNewTerminal);
       setAddTerminalOpen(false);
       setConfig(await api<TerminalConfig>('/api/config'));
@@ -635,7 +641,8 @@ export default function App() {
         <button className="primary settings-submit" type="submit" disabled={!config?.settingsEnabled || settingsBusy || !adminPin}>{settingsBusy ? 'Checking…' : 'Unlock terminal settings'}<span>→</span></button>
       </form> : <form onSubmit={saveSettings}>
         <p className="field-note settings-note">Edit terminal name, selector label, Nexo InitiatingParty, and optional POI identification. UMID, UTID, and JWT are deliberately managed in the backend/Render environment and are never sent to this browser.</p>
-        <p className="field-note settings-note"><strong>Storage:</strong> terminal settings, including terminals you add or remove here, are saved to a file on the backend. On Render free that file is lost whenever the service restarts or redeploys; the terminals then go back to the ones in the Render environment settings.</p>
+        {storageInfo?.warning && <div className="notice" role="alert"><strong>Storage warning:</strong> {storageInfo.warning}</div>}
+        <p className="field-note settings-note"><strong>Storage:</strong> {storageInfo?.message ?? 'Terminal settings, including terminals you add or remove here, are saved to a file on the backend. On Render free that file is lost whenever the service restarts or redeploys; the terminals then go back to the ones in the Render environment settings.'}</p>
         {settings.map((terminal, index) => <div className="terminal-settings-card" key={terminal.id}>
           <div className="card-title"><div><span className="eyebrow">{terminal.id}</span><h3>{terminal.label || terminal.name}</h3></div><span className="step">{terminal.configured ? 'READY' : 'CREDENTIALS PENDING'}</span></div>
           <div className="catalog-settings-meta terminal-settings-fields">
