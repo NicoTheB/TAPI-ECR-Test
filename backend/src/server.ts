@@ -11,6 +11,8 @@ import { buildStatusSlip, learnReceiptIdentity } from './receiptHeader';
 import type { ReceiptIdentity } from './receiptHeader';
 import { applySavedTerminals, applyTerminalDocument, MAX_TERMINALS, nextTerminalId, removedAfterRemoving, removeTerminalById } from './terminalSettings';
 import type { TerminalDocument } from './terminalSettings';
+import { deleteKey, historyKey, loadEncrypted, loadPlain, mergeHistory, parseHistory, PRODUCTS_KEY, productsStoredRemotely, safeMessage, saveEncrypted, savePlain, secretsStoredRemotely, serializeHistory, StoreError, storageStatus, TERMINALS_KEY } from './persistentStore';
+import type { HistoryDoc } from './persistentStore';
 import { getLogRecords, logEvent, redactForLog } from './structuredLog';
 
 const app = express();
@@ -152,7 +154,55 @@ function requireAdmin(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
+class HttpError extends Error {
+  constructor(public status: number, message: string) { super(message); }
+}
+// Settings changes run one at a time so two quick requests cannot overwrite each other.
+let settingsQueue: Promise<unknown> = Promise.resolve();
+function serialized<T>(task: () => Promise<T>): Promise<T> {
+  const run = settingsQueue.then(() => task());
+  settingsQueue = run.catch(() => undefined);
+  return run;
+}
+
+// With persistent storage the product catalog is kept in memory after it has been loaded.
+let productCatalogCache: z.infer<typeof productCatalogSchema> | undefined;
+let productStoreLoaded = !productsStoredRemotely();
+let productStoreError = '';
+async function loadRemoteProductCatalog() {
+  if (!productsStoredRemotely()) return;
+  try {
+    const text = await loadPlain(PRODUCTS_KEY);
+    if (text !== null) {
+      productCatalogCache = productCatalogSchema.parse(JSON.parse(text));
+      logEvent('product_catalog_loaded', { source: 'persistent_storage', products: productCatalogCache.products.length });
+    }
+    productStoreLoaded = true;
+    productStoreError = '';
+  } catch (error) {
+    productStoreLoaded = false;
+    productStoreError = safeMessage(error);
+    logEvent('product_catalog_load_failed', { error: productStoreError });
+  }
+}
+// Saving over a catalog that could not be read could destroy it, so read it again first.
+async function ensureProductStore() {
+  if (!productsStoredRemotely() || productStoreLoaded) return;
+  await loadRemoteProductCatalog();
+  if (!productStoreLoaded) throw new StoreError(`Persistent storage is not reachable, so the product catalog cannot be saved right now. ${productStoreError}`.trim());
+  if (productCatalogCache) throw new HttpError(409, 'The saved product catalog was just loaded from persistent storage. Reload this page, unlock the catalog again and repeat your edits.');
+}
+async function saveProductCatalog(catalog: z.infer<typeof productCatalogSchema>) {
+  if (productsStoredRemotely()) {
+    await savePlain(PRODUCTS_KEY, JSON.stringify(catalog));
+    productCatalogCache = catalog;
+    return;
+  }
+  writeProductCatalog(catalog);
+}
+
 function readProductCatalog() {
+  if (productCatalogCache) return productCatalogCache;
   const persisted = path.resolve(process.cwd(), cloudConfig.productsFile);
   const starter = path.resolve(process.cwd(), 'public/products.json');
   const file = existsSync(persisted) ? persisted : starter;
@@ -185,19 +235,23 @@ app.get('/api/admin/products', requireAdmin, (_req, res) => {
   try { res.json(readProductCatalog()); }
   catch (error) { res.status(500).json({ error: error instanceof Error ? error.message : 'Could not load product catalog.' }); }
 });
-app.put('/api/admin/products', requireAdmin, (req, res) => {
+app.put('/api/admin/products', requireAdmin, async (req, res) => {
   try {
     const catalog = productCatalogSchema.parse(req.body);
     const ids = catalog.products.map(product => product.id.toLowerCase());
     if (new Set(ids).size !== ids.length) { res.status(400).json({ error: 'Product IDs must be unique.' }); return; }
-    writeProductCatalog(catalog);
+    await serialized(async () => {
+      await ensureProductStore();
+      await saveProductCatalog(catalog);
+    });
     res.json(catalog);
   } catch (error) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Invalid product catalog.', details: error.issues.map(issue => ({ field: issue.path.join('.'), message: issue.message })) });
       return;
     }
-    res.status(400).json({ error: error instanceof Error ? error.message : 'Could not save product catalog.' });
+    if (error instanceof HttpError) { res.status(error.status).json({ error: error.message }); return; }
+    res.status(error instanceof StoreError ? 502 : 400).json({ error: error instanceof Error ? error.message : 'Could not save product catalog.' });
   }
 });
 
@@ -240,66 +294,229 @@ function publicTerminalSettings() {
   }));
 }
 
-// IDs of terminals removed in the settings screen (see terminalSettings.ts).
-let removedTerminalIds: string[] = [];
-function readTerminalFile(): TerminalDocument | undefined {
-  const file = path.resolve(process.cwd(), cloudConfig.terminalSettingsFile);
-  if (!existsSync(file)) return undefined;
-  const raw = JSON.parse(readFileSync(file, 'utf8'));
+// ---- Saved terminal settings ------------------------------------------------------------------
+// With UPSTASH_REDIS_REST_URL / _TOKEN / SETTINGS_ENCRYPTION_KEY set, they live in Upstash Redis
+// (encrypted) and the local file is not used. Otherwise they are kept in a local file, which on
+// Render free is lost whenever the service restarts.
+let terminalDoc: TerminalDocument = { terminals: [], removed: [] };
+let terminalStoreLoaded = !secretsStoredRemotely();
+let terminalStoreError = '';
+
+function parseTerminalDocument(raw: unknown): TerminalDocument {
   // Older versions saved a plain array of terminal records.
   if (Array.isArray(raw)) return { terminals: z.array(terminalRecordSchema).max(50).parse(raw), removed: [] };
   return terminalFileSchema.parse(raw);
 }
-function loadTerminalSettings() {
-  const doc = readTerminalFile();
-  if (!doc) return;
-  removedTerminalIds = doc.removed;
-  applyTerminalDocument(terminals, doc);
+function readLocalTerminalDocument(): TerminalDocument | undefined {
+  const file = path.resolve(process.cwd(), cloudConfig.terminalSettingsFile);
+  if (!existsSync(file)) return undefined;
+  return parseTerminalDocument(JSON.parse(readFileSync(file, 'utf8')));
 }
-function saveTerminalSettings(records: PersistedTerminalSettings[], removed: string[] = removedTerminalIds) {
+function writeLocalTerminalDocument(doc: TerminalDocument) {
   const output = path.resolve(process.cwd(), cloudConfig.terminalSettingsFile);
   mkdirSync(path.dirname(output), { recursive: true });
   const temp = `${output}.${process.pid}.tmp`;
-  writeFileSync(temp, `${JSON.stringify({ terminals: records, removed }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  writeFileSync(temp, `${JSON.stringify(doc, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   renameSync(temp, output);
-  removedTerminalIds = removed;
 }
-// Everything the backend remembers about a terminal that was removed.
-function forgetTerminal(id: string) {
+async function loadTerminalSettings() {
+  let doc: TerminalDocument | undefined;
+  if (secretsStoredRemotely()) {
+    try {
+      const text = await loadEncrypted(TERMINALS_KEY);
+      if (text !== null) {
+        doc = parseTerminalDocument(JSON.parse(text));
+        logEvent('terminal_settings_loaded', { source: 'persistent_storage', savedTerminals: doc.terminals.length, removedTerminals: doc.removed.length });
+      } else {
+        // First start with persistent storage: carry over a local file if there is one.
+        doc = readLocalTerminalDocument();
+        if (doc) {
+          await saveEncrypted(TERMINALS_KEY, JSON.stringify(doc));
+          logEvent('terminal_settings_seeded', { source: 'local_file', savedTerminals: doc.terminals.length });
+        }
+      }
+      terminalStoreLoaded = true;
+      terminalStoreError = '';
+    } catch (error) {
+      // Keep running with the terminals from the environment settings, but block changes until
+      // the saved settings can be read, so they are never overwritten.
+      terminalStoreLoaded = false;
+      terminalStoreError = safeMessage(error);
+      logEvent('terminal_settings_load_failed', { error: terminalStoreError });
+      doc = undefined;
+    }
+  } else {
+    doc = readLocalTerminalDocument();
+  }
+  if (!doc) return;
+  terminalDoc = doc;
+  applyTerminalDocument(terminals, doc);
+}
+async function ensureTerminalStore() {
+  if (!secretsStoredRemotely() || terminalStoreLoaded) return;
+  await loadTerminalSettings();
+  if (!terminalStoreLoaded) throw new StoreError(`Persistent storage is not reachable, so terminal settings cannot be changed right now. ${terminalStoreError}`.trim());
+  throw new HttpError(409, 'The saved terminal settings were just loaded from persistent storage. Reload this page, unlock Terminal settings again and repeat your change.');
+}
+async function persistTerminalDocument(doc: TerminalDocument) {
+  if (secretsStoredRemotely()) {
+    await ensureTerminalStore();
+    await saveEncrypted(TERMINALS_KEY, JSON.stringify(doc));
+  } else {
+    writeLocalTerminalDocument(doc);
+  }
+  terminalDoc = doc;
+}
+
+// ---- Payment history in persistent storage ------------------------------------------------------
+// One encrypted document per terminal (see persistentStore.ts). It is loaded at start-up, saved
+// after every payment, refund, reversal and capture, and never written before it has been read, so
+// stored history cannot be overwritten by an empty one.
+type HistoryState = { loaded: boolean; running: boolean; again: boolean; loading?: Promise<boolean>; current?: Promise<void>; error?: string };
+const historyState = new Map<string, HistoryState>();
+function historyStateFor(id: string): HistoryState {
+  let state = historyState.get(id);
+  if (!state) { state = { loaded: false, running: false, again: false }; historyState.set(id, state); }
+  return state;
+}
+function buildHistoryDoc(id: string): HistoryDoc {
+  const identity = terminalIdentity.get(id);
+  const latest = latestPayment.get(id);
+  return { v: 1, counter: receiptCounters.get(id) ?? 0, ...(identity ? { identity } : {}), ...(latest ? { latest } : {}), transactions: transactions.get(id) ?? [] };
+}
+function applyHistoryDoc(id: string, doc: HistoryDoc) {
+  transactions.set(id, doc.transactions);
+  receiptCounters.set(id, doc.counter);
+  if (doc.latest) latestPayment.set(id, doc.latest);
+  if (doc.identity) terminalIdentity.set(id, doc.identity);
+}
+function loadHistory(id: string): Promise<boolean> {
+  if (!secretsStoredRemotely()) return Promise.resolve(true);
+  const state = historyStateFor(id);
+  if (state.loaded) return Promise.resolve(true);
+  if (state.loading) return state.loading;
+  const pending = (async () => {
+    try {
+      const text = await loadEncrypted(historyKey(id));
+      const stored = text === null ? undefined : parseHistory(text);
+      const hadMemory = (transactions.get(id)?.length ?? 0) > 0 || latestPayment.has(id);
+      applyHistoryDoc(id, mergeHistory(stored, buildHistoryDoc(id)));
+      state.loaded = true;
+      state.error = undefined;
+      logEvent('payment_history_loaded', { terminalId: id, transactions: transactions.get(id)?.length ?? 0 });
+      // Anything that happened while the store could not be read is saved now.
+      if (hadMemory) scheduleHistorySave(id);
+      return true;
+    } catch (error) {
+      state.error = safeMessage(error);
+      logEvent('payment_history_load_failed', { terminalId: id, error: state.error });
+      return false;
+    } finally {
+      state.loading = undefined;
+    }
+  })();
+  state.loading = pending;
+  return pending;
+}
+async function ensureHistoryLoaded(id: string): Promise<void> {
+  await loadHistory(id);
+}
+// A message for when earlier payments cannot be shown because the stored history could not be read.
+function historyProblem(id: string): string | undefined {
+  if (!secretsStoredRemotely()) return undefined;
+  const state = historyStateFor(id);
+  if (state.loaded) return undefined;
+  return `The payment history could not be read from persistent storage (${state.error ?? 'unknown reason'}), so earlier payments are not available right now. Try again shortly.`;
+}
+function scheduleHistorySave(id: string) {
+  if (!secretsStoredRemotely()) return;
+  const state = historyStateFor(id);
+  if (state.running) { state.again = true; return; }
+  state.running = true;
+  state.current = (async () => {
+    try {
+      do {
+        if (!terminals.some(terminal => terminal.id === id)) return;
+        // Never overwrite stored history that could not be read.
+        if (!state.loaded && !(await loadHistory(id))) return;
+        state.again = false;
+        await saveEncrypted(historyKey(id), serializeHistory(buildHistoryDoc(id)));
+        state.error = undefined;
+      } while (state.again);
+    } catch (error) {
+      state.error = safeMessage(error);
+      logEvent('payment_history_save_failed', { terminalId: id, error: state.error });
+    } finally {
+      state.running = false;
+    }
+  })();
+}
+// A terminal that has just been added has no stored history to read.
+function markHistoryFresh(id: string) {
+  historyStateFor(id).loaded = true;
+}
+// Everything the backend remembers about a terminal that was removed, including its stored history.
+async function forgetTerminal(id: string) {
+  const state = historyState.get(id);
   transactions.delete(id);
   latestPayment.delete(id);
   receiptCounters.delete(id);
   terminalIdentity.delete(id);
+  historyState.delete(id);
+  if (!secretsStoredRemotely()) return;
+  await state?.current; // let a save that is still running finish first, so it cannot bring the key back
+  try { await deleteKey(historyKey(id)); }
+  catch (error) { logEvent('payment_history_delete_failed', { terminalId: id, error: safeMessage(error) }); }
 }
-loadTerminalSettings();
-app.get('/api/admin/terminals', requireAdmin, (_req, res) => res.json({ terminals: publicTerminalSettings() }));
-app.put('/api/admin/terminals', requireAdmin, (req, res) => {
+
+function storageInfo() {
+  const status = storageStatus();
+  const warnings: string[] = [];
+  if (secretsStoredRemotely() && !terminalStoreLoaded) warnings.push(`Saved terminal settings could not be read (${terminalStoreError}). Changes are blocked until persistent storage can be read.`);
+  if (productsStoredRemotely() && !productStoreLoaded) warnings.push(`The saved product catalog could not be read (${productStoreError}).`);
+  if (secretsStoredRemotely()) {
+    const failing = terminals.filter(terminal => historyState.get(terminal.id)?.error);
+    if (failing.length) warnings.push(`Payment history problem for ${failing.map(terminal => terminal.label).join(', ')}: ${historyState.get(failing[0].id)?.error}`);
+  }
+  return { ...status, ...(warnings.length ? { warning: warnings.join(' ') } : {}) };
+}
+function sendAdminError(res: Response, error: unknown, fallback: string, event: string) {
+  if (error instanceof z.ZodError) {
+    res.status(400).json({ error: 'Invalid terminal settings.', details: error.issues.map(issue => ({ field: issue.path.join('.'), message: issue.message })) });
+    return;
+  }
+  if (error instanceof HttpError) { res.status(error.status).json({ error: error.message }); return; }
+  logEvent(event, { error: safeMessage(error) });
+  res.status(error instanceof StoreError ? 502 : 400).json({ error: error instanceof Error ? error.message : fallback });
+}
+
+app.get('/api/admin/terminals', requireAdmin, (_req, res) => res.json({ terminals: publicTerminalSettings(), storage: storageInfo() }));
+app.put('/api/admin/terminals', requireAdmin, async (req, res) => {
   if (activeByTerminal.size) { res.status(409).json({ error: 'Finish all active terminal operations before saving settings.' }); return; }
   try {
     const input = terminalSettingsInputSchema.parse(req.body?.terminals);
-    const ids = input.map(record => record.id.toLowerCase());
-    if (new Set(ids).size !== ids.length || ids.length !== terminals.length || terminals.some(terminal => !ids.includes(terminal.id.toLowerCase()))) {
-      res.status(400).json({ error: 'Keep the configured terminal IDs unchanged and include each terminal exactly once.' }); return;
-    }
-    const records: PersistedTerminalSettings[] = input.map(({ clearJwt, jwt, ...record }) => {
-      const current = terminals.find(terminal => terminal.id === record.id)!;
-      return { ...record, poiId: record.poiId.trim() || current.poiId, jwt: clearJwt ? '' : (jwt?.trim() || current.jwt) };
+    await serialized(async () => {
+      await ensureTerminalStore();
+      const ids = input.map(record => record.id.toLowerCase());
+      if (new Set(ids).size !== ids.length || ids.length !== terminals.length || terminals.some(terminal => !ids.includes(terminal.id.toLowerCase()))) {
+        throw new HttpError(400, 'Keep the configured terminal IDs unchanged and include each terminal exactly once.');
+      }
+      const records: PersistedTerminalSettings[] = input.map(({ clearJwt, jwt, ...record }) => {
+        const current = terminals.find(terminal => terminal.id === record.id)!;
+        return { ...record, poiId: record.poiId.trim() || current.poiId, jwt: clearJwt ? '' : (jwt?.trim() || current.jwt) };
+      });
+      await persistTerminalDocument({ terminals: records, removed: terminalDoc.removed });
+      for (const record of records) {
+        const terminal = terminals.find(item => item.id === record.id)!;
+        terminal.name = record.name; terminal.label = record.label;
+        terminal.initiatingParty = record.initiatingParty; terminal.poiId = record.poiId.trim() || terminal.poiId;
+        terminal.umid = record.umid ?? ''; terminal.utid = record.utid ?? ''; terminal.jwt = record.jwt ?? '';
+      }
+      logEvent('terminal_settings_updated', { terminalIds: records.map(record => record.id), configuredCount: records.filter(record => Boolean(record.umid && record.utid && record.jwt)).length });
     });
-    saveTerminalSettings(records);
-    for (const record of records) {
-      const terminal = terminals.find(item => item.id === record.id)!;
-      terminal.name = record.name; terminal.label = record.label;
-      terminal.initiatingParty = record.initiatingParty; terminal.poiId = record.poiId.trim() || terminal.poiId;
-      terminal.umid = record.umid ?? ''; terminal.utid = record.utid ?? ''; terminal.jwt = record.jwt ?? '';
-    }
-    logEvent('terminal_settings_updated', { terminalIds: records.map(record => record.id), configuredCount: records.filter(record => Boolean(record.umid && record.utid && record.jwt)).length });
-    res.json({ terminals: publicTerminalSettings() });
+    res.json({ terminals: publicTerminalSettings(), storage: storageInfo() });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({ error: 'Invalid terminal settings.', details: error.issues.map(issue => ({ field: issue.path.join('.'), message: issue.message })) }); return;
-    }
-    logEvent('terminal_settings_save_failed', { error: error instanceof Error ? error.message : 'unknown error' });
-    res.status(400).json({ error: error instanceof Error ? error.message : 'Could not save terminal settings.' });
+    sendAdminError(res, error, 'Could not save terminal settings.', 'terminal_settings_save_failed');
   }
 });
 
@@ -312,51 +529,58 @@ const terminalAddSchema = z.object({
   utid: z.string().trim().max(128).optional(),
   jwt: z.string().trim().max(16384).optional(),
 });
-app.post('/api/admin/terminals', requireAdmin, (req, res) => {
+app.post('/api/admin/terminals', requireAdmin, async (req, res) => {
   try {
-    if (terminals.length >= MAX_TERMINALS) { res.status(400).json({ error: `At most ${MAX_TERMINALS} terminals are supported.` }); return; }
     const input = terminalAddSchema.parse(req.body);
-    const id = nextTerminalId(terminals, removedTerminalIds);
-    const record: PersistedTerminalSettings = {
-      id,
-      name: input.name,
-      label: input.label,
-      initiatingParty: input.initiatingParty || `Showroom-${id}`,
-      poiId: input.poiId ?? '',
-      umid: input.umid ?? '',
-      utid: input.utid ?? '',
-      jwt: input.jwt ?? '',
-    };
-    // Save first, then add to the live list, so a failed write leaves nothing half-added.
-    const saved = readTerminalFile()?.terminals ?? [];
-    saveTerminalSettings([...saved.filter(item => item.id !== id), record]);
-    applySavedTerminals(terminals, [record]);
-    logEvent('terminal_added', { terminalId: id, configured: Boolean(record.umid && record.utid && record.jwt) });
-    res.status(201).json({ terminals: publicTerminalSettings(), added: id });
+    const added = await serialized(async () => {
+      await ensureTerminalStore();
+      if (terminals.length >= MAX_TERMINALS) throw new HttpError(400, `At most ${MAX_TERMINALS} terminals are supported.`);
+      const id = nextTerminalId(terminals, terminalDoc.removed);
+      const record: PersistedTerminalSettings = {
+        id,
+        name: input.name,
+        label: input.label,
+        initiatingParty: input.initiatingParty || `Showroom-${id}`,
+        poiId: input.poiId ?? '',
+        umid: input.umid ?? '',
+        utid: input.utid ?? '',
+        jwt: input.jwt ?? '',
+      };
+      // Save first, then add to the live list, so a failed write leaves nothing half-added.
+      await persistTerminalDocument({
+        terminals: [...terminalDoc.terminals.filter(item => item.id !== id), record],
+        removed: terminalDoc.removed.filter(item => item.toLowerCase() !== id.toLowerCase()),
+      });
+      applySavedTerminals(terminals, [record]);
+      markHistoryFresh(id);
+      logEvent('terminal_added', { terminalId: id, configured: Boolean(record.umid && record.utid && record.jwt) });
+      return id;
+    });
+    res.status(201).json({ terminals: publicTerminalSettings(), added, storage: storageInfo() });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({ error: 'Invalid terminal settings.', details: error.issues.map(issue => ({ field: issue.path.join('.'), message: issue.message })) }); return;
-    }
-    logEvent('terminal_add_failed', { error: error instanceof Error ? error.message : 'unknown error' });
-    res.status(400).json({ error: error instanceof Error ? error.message : 'Could not add the terminal.' });
+    sendAdminError(res, error, 'Could not add the terminal.', 'terminal_add_failed');
   }
 });
-app.delete('/api/admin/terminals/:id', requireAdmin, (req, res) => {
+app.delete('/api/admin/terminals/:id', requireAdmin, async (req, res) => {
   const id = String(req.params.id ?? '');
-  if (!terminals.some(terminal => terminal.id === id)) { res.status(404).json({ error: 'No terminal with that ID.' }); return; }
-  if (terminals.length <= 1) { res.status(400).json({ error: 'At least one terminal must remain.' }); return; }
-  if (activeByTerminal.has(id)) { res.status(409).json({ error: 'This terminal has an active operation. Finish or abort it before removing the terminal.' }); return; }
   try {
-    // Save first, then remove from the live list, so a failed write leaves the terminal in place.
-    const saved = readTerminalFile()?.terminals ?? [];
-    saveTerminalSettings(saved.filter(record => record.id !== id), removedAfterRemoving(removedTerminalIds, id));
-    removeTerminalById(terminals, id);
-    forgetTerminal(id);
-    logEvent('terminal_removed', { terminalId: id });
-    res.json({ terminals: publicTerminalSettings(), removed: id });
+    await serialized(async () => {
+      await ensureTerminalStore();
+      if (!terminals.some(terminal => terminal.id === id)) throw new HttpError(404, 'No terminal with that ID.');
+      if (terminals.length <= 1) throw new HttpError(400, 'At least one terminal must remain.');
+      if (activeByTerminal.has(id)) throw new HttpError(409, 'This terminal has an active operation. Finish or abort it before removing the terminal.');
+      // Save first, then remove from the live list, so a failed write leaves the terminal in place.
+      await persistTerminalDocument({
+        terminals: terminalDoc.terminals.filter(record => record.id !== id),
+        removed: removedAfterRemoving(terminalDoc.removed, id),
+      });
+      removeTerminalById(terminals, id);
+      await forgetTerminal(id);
+      logEvent('terminal_removed', { terminalId: id });
+    });
+    res.json({ terminals: publicTerminalSettings(), removed: id, storage: storageInfo() });
   } catch (error) {
-    logEvent('terminal_remove_failed', { error: error instanceof Error ? error.message : 'unknown error' });
-    res.status(400).json({ error: error instanceof Error ? error.message : 'Could not remove the terminal.' });
+    sendAdminError(res, error, 'Could not remove the terminal.', 'terminal_remove_failed');
   }
 });
 
@@ -396,6 +620,8 @@ async function startOperation(kind: WorldlineOperationKind, req: Request, res: R
   }
   const terminal = requireTerminal(input.terminalId, res);
   if (!terminal) return;
+  // A reversal looks up an earlier payment, which may have to be loaded from persistent storage first.
+  if (kind === 'reversal') await ensureHistoryLoaded(terminal.id);
   const currentId = activeByTerminal.get(terminal.id);
   if (currentId) {
     res.status(409).json({ error: `Terminal ${terminal.label} already has an active operation. Finish or abort it first.`, operationId: currentId });
@@ -407,6 +633,8 @@ async function startOperation(kind: WorldlineOperationKind, req: Request, res: R
     const receipt = (input as z.infer<typeof reversalSchema>).receiptNumber;
     originalTransaction = (transactions.get(terminal.id) ?? []).find(item => item.receiptNumber === receipt || item.originalTransaction?.TransactionReference === receipt);
     if (!originalTransaction?.originalTransaction) {
+      const problem = historyProblem(terminal.id);
+      if (problem) { res.status(503).json({ error: problem }); return; }
       res.status(404).json({ error: 'No saved payment matches that transaction reference. Reversal requires an original payment recorded by this showroom backend.' });
       return;
     }
@@ -619,6 +847,7 @@ function completeOperation(operation: Operation, envelope: any) {
     if (list.length > 500) list.splice(0, list.length - 500);
     transactions.set(operation.terminalId, list);
   }
+  if (['payment', 'refund', 'reversal', 'reconciliation'].includes(operation.kind)) scheduleHistorySave(operation.terminalId);
   if (operation.kind === 'reconciliation' && operation.captureEmail && operation.result) {
     operation.result.captureEmail = { status: 'sending' };
     void sendCaptureResultEmail(operation);
@@ -857,21 +1086,33 @@ function normalizeResult(kind: WorldlineOperationKind, raw: any): Record<string,
   return result;
 }
 
-app.get('/api/payments/latest', (req, res) => {
+app.get('/api/payments/latest', async (req, res) => {
   const terminal = chosenTerminal(req.query.terminalId);
   if (!terminal) { res.status(400).json({ error: 'Select a configured terminal.' }); return; }
   if (activeByTerminal.has(terminal.id)) { res.status(409).json({ error: 'Payment lookup is unavailable while this terminal has an active operation.' }); return; }
+  await ensureHistoryLoaded(terminal.id);
   const latest = latestPayment.get(terminal.id);
-  if (!latest) { res.status(404).json({ error: 'No completed payment, reversal or capture is available in this backend session.' }); return; }
+  if (!latest) {
+    const problem = historyProblem(terminal.id);
+    if (problem) { res.status(503).json({ error: problem }); return; }
+    res.status(404).json({ error: 'No completed payment, reversal or capture is available in this backend session.' });
+    return;
+  }
   res.json(latest);
 });
-app.get('/api/payments/:receiptNumber', (req, res) => {
+app.get('/api/payments/:receiptNumber', async (req, res) => {
   const terminal = chosenTerminal(req.query.terminalId);
   if (!terminal) { res.status(400).json({ error: 'Select a configured terminal.' }); return; }
   if (activeByTerminal.has(terminal.id)) { res.status(409).json({ error: 'Receipt lookup is unavailable while this terminal has an active operation.' }); return; }
+  await ensureHistoryLoaded(terminal.id);
   const number = String(req.params.receiptNumber ?? '').trim();
   const found = (transactions.get(terminal.id) ?? []).find(item => item.receiptNumber === number || item.originalTransaction?.TransactionReference === number);
-  if (!found) { res.status(404).json({ error: 'Receipt not found in the showroom transaction history for this backend session.' }); return; }
+  if (!found) {
+    const problem = historyProblem(terminal.id);
+    if (problem) { res.status(503).json({ error: problem }); return; }
+    res.status(404).json({ error: 'Receipt not found in the showroom transaction history for this backend session.' });
+    return;
+  }
   res.json(found.result);
 });
 
@@ -889,7 +1130,25 @@ if (existsSync(staticDir)) {
   app.get('*', (_req, res) => res.sendFile(path.join(staticDir, 'index.html')));
 }
 
-app.listen(cloudConfig.apiPort, '0.0.0.0', () => {
-  const ready = terminals.filter(terminalConfigured).length;
-  console.log(`Worldline showroom backend listening on port ${cloudConfig.apiPort}; ${ready}/${terminals.length} terminal(s) have credentials and IDs configured.`);
+// Render stops the service with SIGTERM when it redeploys or spins it down. Give a payment-history
+// save that is still running (at most a few seconds) the chance to finish first.
+process.on('SIGTERM', () => {
+  const pending = [...historyState.values()].map(state => state.current).filter((current): current is Promise<void> => Boolean(current));
+  void Promise.race([Promise.all(pending), new Promise(resolve => setTimeout(resolve, 5000))]).finally(() => process.exit(0));
+});
+
+// Load what was saved (terminal settings, product catalog, payment history) before accepting
+// requests, so a restart never serves stale settings. Nothing is read when persistent storage is
+// not configured.
+void (async () => {
+  await Promise.all([loadTerminalSettings(), loadRemoteProductCatalog()]);
+  await Promise.all(terminals.map(terminal => loadHistory(terminal.id)));
+  app.listen(cloudConfig.apiPort, '0.0.0.0', () => {
+    const ready = terminals.filter(terminalConfigured).length;
+    const storage = storageStatus();
+    console.log(`Worldline showroom backend listening on port ${cloudConfig.apiPort}; ${ready}/${terminals.length} terminal(s) have credentials and IDs configured. Storage: terminals=${storage.terminals}, products=${storage.products}, history=${storage.history}.`);
+  });
+})().catch(error => {
+  console.error('Startup failed:', error instanceof Error ? error.message : error);
+  process.exit(1);
 });
